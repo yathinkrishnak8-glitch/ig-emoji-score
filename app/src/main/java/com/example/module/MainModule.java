@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.text.InputType;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.widget.EditText;
@@ -14,31 +15,21 @@ import androidx.annotation.NonNull;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
-import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
-import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
-import io.github.libxposed.api.annotations.AfterInvocation;
-import io.github.libxposed.api.annotations.BeforeInvocation;
-import io.github.libxposed.api.annotations.XposedHooker;
 
 public class MainModule extends XposedModule {
 
-    private static MainModule instance;
-    private static volatile int targetScore = 999;
+    private static final String TAG = "IG-Emoji-Score";
+    private static volatile int targetScore = 99;
     private static volatile boolean enabled = true;
-    private static final Set<String> hookedClasses = new HashSet<>();
-    private static Activity activeActivity = null;
-
-    public MainModule(@NonNull XposedInterface base, @NonNull ModuleLoadedParam param) {
-        super(base, param);
-        instance = this;
-    }
+    private static final Set<String> checkedClasses = ConcurrentHashMap.newKeySet();
+    private static volatile Activity activeActivity = null;
 
     @Override
-    public void onPackageLoaded(@NonNull PackageLoadedParam param) {
-        super.onPackageLoaded(param);
+    public void onPackageReady(@NonNull PackageReadyParam param) {
         if (!"com.instagram.android".equals(param.getPackageName())) return;
 
         ClassLoader cl = param.getClassLoader();
@@ -46,109 +37,51 @@ public class MainModule extends XposedModule {
         try {
             // 1. Track active Activity & bind Volume Up to open custom score prompt
             Method onResume = Activity.class.getDeclaredMethod("onResume");
-            hook(onResume, ActivityResumeHooker.class);
+            hook(onResume).intercept(chain -> {
+                Object result = chain.proceed();
+                activeActivity = (Activity) chain.getThisObject();
+                return result;
+            });
 
             Method dispatchKey = Activity.class.getDeclaredMethod("dispatchKeyEvent", KeyEvent.class);
-            hook(dispatchKey, KeyEventHooker.class);
+            hook(dispatchKey).intercept(chain -> {
+                KeyEvent ev = (KeyEvent) chain.getArg(0);
+                if (ev != null && ev.getAction() == KeyEvent.ACTION_DOWN
+                        && ev.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP
+                        && activeActivity != null) {
+                    promptScore(activeActivity);
+                    return true;
+                }
+                return chain.proceed();
+            });
 
             // 2. Catch Emoji Pong View when attached to window
             Method onAttached = View.class.getDeclaredMethod("onAttachedToWindow");
-            hook(onAttached, ViewAttachHooker.class);
+            hook(onAttached).intercept(chain -> {
+                Object result = chain.proceed();
+                Object view = chain.getThisObject();
+                if (view != null) {
+                    Class<?> c = view.getClass();
+                    if (checkedClasses.add(c.getName()) && looksLikePongView(c)) {
+                        hookPongMethods(c);
+                    }
+                }
+                return result;
+            });
 
             // 3. Override local SharedPreferences high score writes
             Class<?> editor = cl.loadClass("android.app.SharedPreferencesImpl$EditorImpl");
             Method putInt = editor.getDeclaredMethod("putInt", String.class, int.class);
-            hook(putInt, PrefsPutIntHooker.class);
+            hook(putInt).intercept(chain -> {
+                String key = (String) chain.getArg(0);
+                if (enabled && key != null && (key.contains("emoji_pong") || key.contains("pong_high_score"))) {
+                    return chain.proceed(new Object[]{key, targetScore});
+                }
+                return chain.proceed();
+            });
 
         } catch (Throwable t) {
-            log("Hook setup error: " + t.getMessage());
-        }
-    }
-
-    @XposedHooker
-    public static class ActivityResumeHooker implements XposedInterface.Hooker {
-        @AfterInvocation
-        public static void after(@NonNull XposedInterface.AfterHookCallback callback) {
-            activeActivity = (Activity) callback.getThisObject();
-        }
-    }
-
-    @XposedHooker
-    public static class KeyEventHooker implements XposedInterface.Hooker {
-        @BeforeInvocation
-        public static void before(@NonNull XposedInterface.BeforeHookCallback callback) {
-            KeyEvent ev = (KeyEvent) callback.getArgs()[0];
-            if (ev.getAction() == KeyEvent.ACTION_DOWN
-                    && ev.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP
-                    && activeActivity != null) {
-                promptScore(activeActivity);
-                callback.returnAndSkip(true);
-            }
-        }
-    }
-
-    @XposedHooker
-    public static class PrefsPutIntHooker implements XposedInterface.Hooker {
-        @BeforeInvocation
-        public static void before(@NonNull XposedInterface.BeforeHookCallback callback) {
-            String key = (String) callback.getArgs()[0];
-            if (enabled && key != null && (key.contains("emoji_pong") || key.contains("pong_high_score"))) {
-                callback.getArgs()[1] = targetScore;
-            }
-        }
-    }
-
-    @XposedHooker
-    public static class ViewAttachHooker implements XposedInterface.Hooker {
-        @AfterInvocation
-        public static void after(@NonNull XposedInterface.AfterHookCallback callback) {
-            Object view = callback.getThisObject();
-            if (view == null) return;
-            Class<?> c = view.getClass();
-            String name = c.getName();
-            if (!hookedClasses.contains(name) && looksLikePongView(c)) {
-                hookedClasses.add(name);
-                hookPongMethods(c);
-            }
-        }
-    }
-
-    @XposedHooker
-    public static class SingleIntArgHooker implements XposedInterface.Hooker {
-        @BeforeInvocation
-        public static void before(@NonNull XposedInterface.BeforeHookCallback callback) {
-            if (enabled && (int) callback.getArgs()[0] > 0) {
-                callback.getArgs()[0] = targetScore;
-            }
-        }
-    }
-
-    @XposedHooker
-    public static class ThreadScoreHooker implements XposedInterface.Hooker {
-        @BeforeInvocation
-        public static void before(@NonNull XposedInterface.BeforeHookCallback callback) {
-            if (enabled && (int) callback.getArgs()[1] > 0) {
-                callback.getArgs()[1] = targetScore;
-            }
-        }
-    }
-
-    @XposedHooker
-    public static class VoidGameOverHooker implements XposedInterface.Hooker {
-        @BeforeInvocation
-        public static void before(@NonNull XposedInterface.BeforeHookCallback callback) {
-            Object obj = callback.getThisObject();
-            if (!enabled || obj == null) return;
-            for (Field f : obj.getClass().getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers()) || f.getType() != int.class) continue;
-                try {
-                    f.setAccessible(true);
-                    int cur = f.getInt(obj);
-                    if (cur > 0 && cur < 400) {
-                        f.setInt(obj, targetScore);
-                    }
-                } catch (Throwable ignored) {}
-            }
+            log(Log.ERROR, TAG, "Hook setup error", t);
         }
     }
 
@@ -169,18 +102,44 @@ public class MainModule extends XposedModule {
         return gfx && floats >= 4 && ints >= 1 && ints <= 6;
     }
 
-    private static void hookPongMethods(Class<?> c) {
-        if (instance == null) return;
+    private void hookPongMethods(Class<?> c) {
         for (Method m : c.getDeclaredMethods()) {
             if (Modifier.isAbstract(m.getModifiers())) continue;
             Class<?>[] p = m.getParameterTypes();
             try {
                 if (p.length == 1 && p[0] == int.class) {
-                    instance.hook(m, SingleIntArgHooker.class);
+                    hook(m).intercept(chain -> {
+                        int arg = (int) chain.getArg(0);
+                        if (enabled && arg > 0) {
+                            return chain.proceed(new Object[]{targetScore});
+                        }
+                        return chain.proceed();
+                    });
                 } else if (p.length == 2 && p[0] == String.class && p[1] == int.class) {
-                    instance.hook(m, ThreadScoreHooker.class);
+                    hook(m).intercept(chain -> {
+                        int arg = (int) chain.getArg(1);
+                        if (enabled && arg > 0) {
+                            return chain.proceed(new Object[]{chain.getArg(0), targetScore});
+                        }
+                        return chain.proceed();
+                    });
                 } else if (p.length == 0 && m.getReturnType() == void.class) {
-                    instance.hook(m, VoidGameOverHooker.class);
+                    hook(m).intercept(chain -> {
+                        Object obj = chain.getThisObject();
+                        if (enabled && obj != null) {
+                            for (Field f : obj.getClass().getDeclaredFields()) {
+                                if (Modifier.isStatic(f.getModifiers()) || f.getType() != int.class) continue;
+                                try {
+                                    f.setAccessible(true);
+                                    int cur = f.getInt(obj);
+                                    if (cur > 0 && cur < 400) {
+                                        f.setInt(obj, targetScore);
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                        }
+                        return chain.proceed();
+                    });
                 }
             } catch (Throwable ignored) {}
         }
