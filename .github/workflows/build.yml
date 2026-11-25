@@ -10,20 +10,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup libxposed-api cleanly
+      - name: Clone and Map libxposed Submodule
         run: |
-          rm -rf libxposed libxposed-api libxposed-compat libxposed-src
-          git clone --depth 1 https://github.com/libxposed/api.git libxposed-src
+          echo "=== .gitmodules ===" && cat .gitmodules
+          echo "=== settings.gradle.kts ===" && cat settings.gradle.kts
           
-          # Find the real directories containing build.gradle(.kts) inside libxposed-src
-          API_DIR=$(find libxposed-src -maxdepth 3 -name "build.gradle*" -path "*/api/*" -exec dirname {} \; | head -n 1)
-          COMPAT_DIR=$(find libxposed-src -maxdepth 3 -name "build.gradle*" -path "*/compat/*" -exec dirname {} \; | head -n 1)
+          SUB_URL=$(git config -f .gitmodules --get-regexp url | awk '{print $2}' | head -n 1)
+          rm -rf libxposed-api libxposed-compat libxposed-tmp
+          git clone --depth 1 "${SUB_URL:-https://github.com/libxposed/api.git}" libxposed-tmp
           
-          echo "Found API_DIR=$API_DIR"
-          echo "Found COMPAT_DIR=$COMPAT_DIR"
+          # Populate libxposed-api with the full cloned repo
+          cp -r libxposed-tmp libxposed-api
           
-          cp -r "${API_DIR:-libxposed-src}" libxposed-api
-          cp -r "${COMPAT_DIR:-libxposed-src}" libxposed-compat
+          # Also satisfy root-level libxposed-compat if settings.gradle.kts points there
+          COMPAT_PATH=$(find libxposed-tmp -maxdepth 3 -name "build.gradle*" -path "*compat*" -exec dirname {} \; | head -n 1)
+          if [ -n "$COMPAT_PATH" ]; then
+            cp -r "$COMPAT_PATH" libxposed-compat
+          fi
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
