@@ -7,9 +7,11 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.util.Log;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
@@ -21,8 +23,6 @@ import androidx.annotation.NonNull;
 
 import java.lang.reflect.Method;
 import java.util.Deque;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 import io.github.libxposed.api.XposedModule;
@@ -30,14 +30,20 @@ import io.github.libxposed.api.XposedModule;
 public class MainModule extends XposedModule {
 
     private static final String TAG = "IG-Emoji-Score";
-    private static final int MAX_LOG_LINES = 250;
+    private static final int MAX_LOG_LINES = 150;
     private static volatile int targetScore = 99;
     private static volatile boolean enabled = true;
-    private static volatile long captureUntilMs = 0;
-    private static final Set<String> seenActivities = ConcurrentHashMap.newKeySet();
     private static final Deque<String> logBuffer = new ConcurrentLinkedDeque<>();
     private static volatile Activity activeActivity = null;
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private static boolean loopRunning = false;
+    private static boolean touchDown = false;
+    private static long downTime = 0L;
+    private static ViewGroup cachedArena = null;
+    private static TextView cachedScoreView = null;
+    private static TextView cachedBallView = null;
+    private static View cachedPaddleView = null;
 
     private void addLog(String msg) {
         logBuffer.addLast(msg);
@@ -49,28 +55,24 @@ public class MainModule extends XposedModule {
         } catch (Throwable ignored) {}
     }
 
-    private boolean isCapturing() {
-        return System.currentTimeMillis() < captureUntilMs;
-    }
-
     @Override
     public void onPackageReady(@NonNull PackageReadyParam param) {
         if (!"com.instagram.android".equals(param.getPackageName())) return;
-
-        ClassLoader cl = param.getClassLoader();
         addLog("onPackageReady: hooking com.instagram.android");
 
         try {
-            // 1. Track active Activity & bind Volume Up to open menu
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             hook(onResume).intercept(chain -> {
                 Object result = chain.proceed();
-                Activity act = (Activity) chain.getThisObject();
-                activeActivity = act;
-                if (act != null && seenActivities.add(act.getClass().getName())) {
-                    addLog("Activity resumed: " + act.getClass().getName());
-                }
+                activeActivity = (Activity) chain.getThisObject();
+                startBotLoop();
                 return result;
+            });
+
+            Method onPause = Activity.class.getDeclaredMethod("onPause");
+            hook(onPause).intercept(chain -> {
+                releaseTouch(activeActivity);
+                return chain.proceed();
             });
 
             Method dispatchKey = Activity.class.getDeclaredMethod("dispatchKeyEvent", KeyEvent.class);
@@ -84,115 +86,197 @@ public class MainModule extends XposedModule {
                 }
                 return chain.proceed();
             });
-
-            // 2. Capture TextView.setText during 5s window to find score updates
-            Method setText = TextView.class.getDeclaredMethod("setText", CharSequence.class, TextView.BufferType.class);
-            hook(setText).intercept(chain -> {
-                if (isCapturing()) {
-                    CharSequence cs = (CharSequence) chain.getArg(0);
-                    if (cs != null && cs.length() > 0 && cs.length() <= 24) {
-                        String s = cs.toString().trim();
-                        if (s.matches("\\d+") || s.toLowerCase().contains("score") || s.toLowerCase().contains("best")) {
-                            addLog("TextView.setText(\"" + s + "\") on " + chain.getThisObject().getClass().getName()
-                                    + " caller=" + getAppCaller());
-                        }
-                    }
-                }
-                return chain.proceed();
-            });
-
-            // 3. Capture & override SharedPreferences writes
-            Class<?> editor = cl.loadClass("android.app.SharedPreferencesImpl$EditorImpl");
-            Method putInt = editor.getDeclaredMethod("putInt", String.class, int.class);
-            hook(putInt).intercept(chain -> {
-                String key = (String) chain.getArg(0);
-                int val = (int) chain.getArg(1);
-                if (key != null) {
-                    String low = key.toLowerCase();
-                    if (isCapturing() || low.contains("pong") || low.contains("emoji") || low.contains("score")) {
-                        addLog("Prefs.putInt: key=" + key + " val=" + val);
-                    }
-                    if (enabled && (low.contains("emoji_pong") || low.contains("pong_high_score")
-                            || (low.contains("pong") && low.contains("score")))) {
-                        addLog("Prefs.putInt OVERRIDE: " + key + " -> " + targetScore);
-                        return chain.proceed(new Object[]{key, targetScore});
-                    }
-                }
-                return chain.proceed();
-            });
-
-            Method putLong = editor.getDeclaredMethod("putLong", String.class, long.class);
-            hook(putLong).intercept(chain -> {
-                String key = (String) chain.getArg(0);
-                long val = (long) chain.getArg(1);
-                if (key != null) {
-                    String low = key.toLowerCase();
-                    if (isCapturing() || low.contains("pong") || low.contains("emoji") || low.contains("score")) {
-                        addLog("Prefs.putLong: key=" + key + " val=" + val);
-                    }
-                    if (enabled && (low.contains("emoji_pong") || low.contains("pong_high_score")
-                            || (low.contains("pong") && low.contains("score")))) {
-                        addLog("Prefs.putLong OVERRIDE: " + key + " -> " + targetScore);
-                        return chain.proceed(new Object[]{key, (long) targetScore});
-                    }
-                }
-                return chain.proceed();
-            });
-
         } catch (Throwable t) {
             addLog("Hook setup error: " + t.getMessage());
         }
     }
 
-    private static String getAppCaller() {
-        StackTraceElement[] st = Thread.currentThread().getStackTrace();
-        for (StackTraceElement el : st) {
-            String cn = el.getClassName();
-            if (cn.startsWith("X.") || cn.startsWith("com.instagram.")) {
-                return cn + "." + el.getMethodName() + ":" + el.getLineNumber();
+    private static void startBotLoop() {
+        if (loopRunning) return;
+        loopRunning = true;
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                long delayMs = 200;
+                try {
+                    Activity act = activeActivity;
+                    if (enabled && act != null && !act.isFinishing()) {
+                        if (!isArenaValid()) {
+                            findPongViews(act.getWindow().getDecorView());
+                        }
+                        if (isArenaValid()) {
+                            stepBot(act);
+                            delayMs = 16; // ~60fps while Emoji Pong is active
+                        } else {
+                            releaseTouch(act);
+                        }
+                    } else {
+                        releaseTouch(act);
+                    }
+                } catch (Throwable ignored) {}
+                mainHandler.postDelayed(this, delayMs);
             }
-        }
-        return "?";
+        });
     }
 
-    private void dumpViewHierarchy(Activity act) {
+    private static boolean isArenaValid() {
+        return cachedArena != null
+                && cachedScoreView != null
+                && cachedBallView != null
+                && cachedPaddleView != null
+                && cachedArena.isAttachedToWindow()
+                && cachedArena.isShown()
+                && cachedBallView.isShown()
+                && cachedPaddleView.isShown();
+    }
+
+    private static void findPongViews(View root) {
+        cachedArena = null;
+        cachedScoreView = null;
+        cachedBallView = null;
+        cachedPaddleView = null;
+        if (root instanceof ViewGroup) {
+            scanGroup((ViewGroup) root);
+        }
+    }
+
+    private static boolean scanGroup(ViewGroup vg) {
+        if (vg == null || vg.getVisibility() != View.VISIBLE) return false;
+
+        TextView scoreCandidate = null;
+        TextView ballCandidate = null;
+        View paddleCandidate = null;
+        boolean hasHighScoreLabel = false;
+
+        int childCount = vg.getChildCount();
+        for (int i = 0; i < childCount; i++) {
+            View child = vg.getChildAt(i);
+            if (child.getVisibility() != View.VISIBLE) continue;
+
+            if (child instanceof TextView) {
+                TextView tv = (TextView) child;
+                CharSequence cs = tv.getText();
+                String text = cs != null ? cs.toString().trim() : "";
+                int w = tv.getWidth();
+                int h = tv.getHeight();
+
+                if (text.startsWith("HI ") || text.startsWith("HI\n")) {
+                    hasHighScoreLabel = true;
+                } else if (text.matches("\\d+") && h >= 220) {
+                    scoreCandidate = tv;
+                } else if (!text.isEmpty() && w > 0 && w <= 250 && h > 0 && h <= 250) {
+                    ballCandidate = tv;
+                }
+            } else if (child instanceof ViewGroup) {
+                if (containsHighScoreText((ViewGroup) child)) {
+                    hasHighScoreLabel = true;
+                }
+            } else if ("com.instagram.common.ui.base.IgView".equals(child.getClass().getName())) {
+                int w = child.getWidth();
+                int h = child.getHeight();
+                if (w >= 120 && w <= 600 && h >= 40 && h <= 250) {
+                    paddleCandidate = child;
+                }
+            }
+        }
+
+        if (hasHighScoreLabel && scoreCandidate != null && ballCandidate != null && paddleCandidate != null) {
+            cachedArena = vg;
+            cachedScoreView = scoreCandidate;
+            cachedBallView = ballCandidate;
+            cachedPaddleView = paddleCandidate;
+            return true;
+        }
+
+        for (int i = 0; i < childCount; i++) {
+            View child = vg.getChildAt(i);
+            if (child instanceof ViewGroup && scanGroup((ViewGroup) child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsHighScoreText(ViewGroup vg) {
+        for (int i = 0; i < vg.getChildCount(); i++) {
+            View c = vg.getChildAt(i);
+            if (c instanceof TextView) {
+                CharSequence cs = ((TextView) c).getText();
+                if (cs != null && cs.toString().trim().startsWith("HI ")) {
+                    return true;
+                }
+            } else if (c instanceof ViewGroup && containsHighScoreText((ViewGroup) c)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void stepBot(Activity act) {
+        int currentScore = parseScore(cachedScoreView);
+        if (currentScore < 0) return;
+
+        int[] arenaLoc = new int[2];
+        cachedArena.getLocationInWindow(arenaLoc);
+        float arenaLeft = arenaLoc[0];
+        float arenaWidth = cachedArena.getWidth();
+        if (arenaWidth <= 0) return;
+
+        int[] ballLoc = new int[2];
+        cachedBallView.getLocationInWindow(ballLoc);
+        float ballCenterX = ballLoc[0] + cachedBallView.getWidth() / 2f;
+
+        int[] padLoc = new int[2];
+        cachedPaddleView.getLocationInWindow(padLoc);
+        float padY = padLoc[1] + cachedPaddleView.getHeight() / 2f;
+        float padHalfW = cachedPaddleView.getWidth() / 2f;
+
+        float targetX;
+        if (currentScore < targetScore) {
+            // Track ball X
+            targetX = Math.max(arenaLeft + padHalfW, Math.min(arenaLeft + arenaWidth - padHalfW, ballCenterX));
+        } else {
+            // Auto-lose: dodge to the opposite side from the ball
+            float arenaCenterX = arenaLeft + arenaWidth / 2f;
+            if (ballCenterX < arenaCenterX) {
+                targetX = arenaLeft + arenaWidth - padHalfW;
+            } else {
+                targetX = arenaLeft + padHalfW;
+            }
+        }
+
+        long now = SystemClock.uptimeMillis();
+        if (!touchDown) {
+            downTime = now;
+            MotionEvent down = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_DOWN, targetX, padY, 0);
+            act.dispatchTouchEvent(down);
+            down.recycle();
+            touchDown = true;
+        } else {
+            MotionEvent move = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_MOVE, targetX, padY, 0);
+            act.dispatchTouchEvent(move);
+            move.recycle();
+        }
+    }
+
+    private static void releaseTouch(Activity act) {
+        if (!touchDown) return;
+        touchDown = false;
+        if (act != null && !act.isFinishing()) {
+            long now = SystemClock.uptimeMillis();
+            MotionEvent up = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_UP, 0f, 0f, 0);
+            act.dispatchTouchEvent(up);
+            up.recycle();
+        }
+    }
+
+    private static int parseScore(TextView tv) {
         try {
-            View root = act.getWindow().getDecorView();
-            StringBuilder sb = new StringBuilder();
-            sb.append("=== ViewTree (").append(act.getClass().getSimpleName()).append(") ===\n");
-            walkView(root, 0, sb, new int[]{0});
-            addLog(sb.toString());
-        } catch (Throwable t) {
-            addLog("dumpViewHierarchy err: " + t.getMessage());
-        }
-    }
-
-    private void walkView(View v, int depth, StringBuilder sb, int[] count) {
-        if (v == null || v.getVisibility() != View.VISIBLE || count[0] >= 80) return;
-        if (v.getWidth() == 0 && v.getHeight() == 0 && depth > 2) return;
-        count[0]++;
-
-        for (int i = 0; i < depth; i++) sb.append(" ");
-        sb.append(v.getClass().getName())
-                .append(" [").append(v.getWidth()).append("x").append(v.getHeight()).append("]");
-        if (v.getTranslationX() != 0f || v.getTranslationY() != 0f) {
-            sb.append(" tx=").append((int) v.getTranslationX()).append(" ty=").append((int) v.getTranslationY());
-        }
-        if (v instanceof TextView) {
-            CharSequence t = ((TextView) v).getText();
-            if (t != null && t.length() > 0) {
-                String s = t.toString().replace("\n", " ");
-                if (s.length() > 20) s = s.substring(0, 20) + "...";
-                sb.append(" \"").append(s).append("\"");
-            }
-        }
-        sb.append("\n");
-
-        if (v instanceof ViewGroup) {
-            ViewGroup vg = (ViewGroup) v;
-            for (int i = 0; i < vg.getChildCount(); i++) {
-                walkView(vg.getChildAt(i), depth + 1, sb, count);
-            }
+            CharSequence cs = tv.getText();
+            if (cs == null) return -1;
+            return Integer.parseInt(cs.toString().trim());
+        } catch (NumberFormatException e) {
+            return -1;
         }
     }
 
@@ -208,8 +292,7 @@ public class MainModule extends XposedModule {
         tv.setText(text);
         tv.setTextIsSelectable(true);
         tv.setTextSize(10f);
-        int pad = 28;
-        tv.setPadding(pad, pad, pad, pad);
+        tv.setPadding(28, 28, 28, 28);
         scroll.addView(tv);
 
         new AlertDialog.Builder(act)
@@ -227,32 +310,27 @@ public class MainModule extends XposedModule {
                 .show();
     }
 
-    private void promptScore(Activity act) {
+    private static void promptScore(Activity act) {
+        releaseTouch(act);
         EditText et = new EditText(act);
         et.setInputType(InputType.TYPE_CLASS_NUMBER);
         et.setText(String.valueOf(targetScore));
         new AlertDialog.Builder(act)
-                .setTitle("Custom Emoji Score")
+                .setTitle("Auto-Play Target Score")
                 .setView(et)
                 .setPositiveButton("Set", (d, w) -> {
                     try {
                         targetScore = Integer.parseInt(et.getText().toString().trim());
                         enabled = true;
-                        Toast.makeText(act, "Target: " + targetScore, Toast.LENGTH_SHORT).show();
+                        Toast.makeText(act, "Auto-Play Target: " + targetScore, Toast.LENGTH_SHORT).show();
                     } catch (NumberFormatException ignored) {}
                 })
-                .setNeutralButton("Logs (5s)", (d, w) -> {
-                    captureUntilMs = System.currentTimeMillis() + 5000;
-                    dumpViewHierarchy(act);
-                    Toast.makeText(act, "Capturing 5s...", Toast.LENGTH_SHORT).show();
-                    mainHandler.postDelayed(() -> {
-                        Activity cur = activeActivity;
-                        if (cur != null && !cur.isFinishing()) {
-                            showLogsDialog(cur);
-                        }
-                    }, 5000);
+                .setNeutralButton("Logs", (d, w) -> showLogsDialog(act))
+                .setNegativeButton("Off", (d, w) -> {
+                    enabled = false;
+                    releaseTouch(act);
+                    Toast.makeText(act, "Auto-Play Off", Toast.LENGTH_SHORT).show();
                 })
-                .setNegativeButton("Off", (d, w) -> enabled = false)
                 .show();
     }
 }
