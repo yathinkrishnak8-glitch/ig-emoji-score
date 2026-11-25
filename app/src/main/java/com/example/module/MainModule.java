@@ -10,6 +10,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.text.InputType;
 import android.util.Log;
+import android.view.Choreographer;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -33,6 +34,8 @@ public class MainModule extends XposedModule {
     private static final int MAX_LOG_LINES = 150;
     private static volatile int targetScore = 99;
     private static volatile boolean enabled = true;
+    private static volatile boolean dialogOpen = false;
+    private static volatile boolean dispatchingBotTouch = false;
     private static final Deque<String> logBuffer = new ConcurrentLinkedDeque<>();
     private static volatile Activity activeActivity = null;
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -40,10 +43,12 @@ public class MainModule extends XposedModule {
     private static boolean loopRunning = false;
     private static boolean touchDown = false;
     private static long downTime = 0L;
+    private static float prevBallCenterX = -1f;
     private static ViewGroup cachedArena = null;
     private static TextView cachedScoreView = null;
     private static TextView cachedBallView = null;
     private static View cachedPaddleView = null;
+    private static View cachedHighScoreContainer = null;
 
     private void addLog(String msg) {
         logBuffer.addLast(msg);
@@ -72,6 +77,19 @@ public class MainModule extends XposedModule {
             Method onPause = Activity.class.getDeclaredMethod("onPause");
             hook(onPause).intercept(chain -> {
                 releaseTouch(activeActivity);
+                setKeepScreenOn(false);
+                return chain.proceed();
+            });
+
+            Method dispatchTouch = Activity.class.getDeclaredMethod("dispatchTouchEvent", MotionEvent.class);
+            hook(dispatchTouch).intercept(chain -> {
+                if (!dispatchingBotTouch && enabled && !dialogOpen && isArenaValid()) {
+                    int score = parseScore(cachedScoreView);
+                    if (score >= 0 && score < targetScore) {
+                        // Swallow accidental user touches while auto-playing
+                        return true;
+                    }
+                }
                 return chain.proceed();
             });
 
@@ -94,29 +112,44 @@ public class MainModule extends XposedModule {
     private static void startBotLoop() {
         if (loopRunning) return;
         loopRunning = true;
-        mainHandler.post(new Runnable() {
+        Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
+            private long lastScanMs = 0L;
+
             @Override
-            public void run() {
-                long delayMs = 200;
+            public void doFrame(long frameTimeNanos) {
                 try {
                     Activity act = activeActivity;
-                    if (enabled && act != null && !act.isFinishing()) {
-                        if (!isArenaValid()) {
+                    if (enabled && !dialogOpen && act != null && !act.isFinishing()) {
+                        long nowMs = SystemClock.uptimeMillis();
+                        if (!isArenaValid() && nowMs - lastScanMs >= 200) {
+                            lastScanMs = nowMs;
                             findPongViews(act.getWindow().getDecorView());
                         }
                         if (isArenaValid()) {
+                            setKeepScreenOn(true);
                             stepBot(act);
-                            delayMs = 16; // ~60fps while Emoji Pong is active
                         } else {
+                            prevBallCenterX = -1f;
                             releaseTouch(act);
+                            setKeepScreenOn(false);
                         }
                     } else {
+                        prevBallCenterX = -1f;
                         releaseTouch(act);
+                        setKeepScreenOn(false);
                     }
                 } catch (Throwable ignored) {}
-                mainHandler.postDelayed(this, delayMs);
+                Choreographer.getInstance().postFrameCallback(this);
             }
         });
+    }
+
+    private static void setKeepScreenOn(boolean keepOn) {
+        try {
+            if (cachedArena != null && cachedArena.getKeepScreenOn() != keepOn) {
+                cachedArena.setKeepScreenOn(keepOn);
+            }
+        } catch (Throwable ignored) {}
     }
 
     private static boolean isArenaValid() {
@@ -135,6 +168,7 @@ public class MainModule extends XposedModule {
         cachedScoreView = null;
         cachedBallView = null;
         cachedPaddleView = null;
+        cachedHighScoreContainer = null;
         if (root instanceof ViewGroup) {
             scanGroup((ViewGroup) root);
         }
@@ -146,7 +180,7 @@ public class MainModule extends XposedModule {
         TextView scoreCandidate = null;
         TextView ballCandidate = null;
         View paddleCandidate = null;
-        boolean hasHighScoreLabel = false;
+        View highScoreContainer = null;
 
         int childCount = vg.getChildCount();
         for (int i = 0; i < childCount; i++) {
@@ -161,7 +195,7 @@ public class MainModule extends XposedModule {
                 int h = tv.getHeight();
 
                 if (text.startsWith("HI ") || text.startsWith("HI\n")) {
-                    hasHighScoreLabel = true;
+                    highScoreContainer = tv;
                 } else if (text.matches("\\d+") && h >= 220) {
                     scoreCandidate = tv;
                 } else if (!text.isEmpty() && w > 0 && w <= 250 && h > 0 && h <= 250) {
@@ -169,7 +203,7 @@ public class MainModule extends XposedModule {
                 }
             } else if (child instanceof ViewGroup) {
                 if (containsHighScoreText((ViewGroup) child)) {
-                    hasHighScoreLabel = true;
+                    highScoreContainer = child;
                 }
             } else if ("com.instagram.common.ui.base.IgView".equals(child.getClass().getName())) {
                 int w = child.getWidth();
@@ -180,11 +214,12 @@ public class MainModule extends XposedModule {
             }
         }
 
-        if (hasHighScoreLabel && scoreCandidate != null && ballCandidate != null && paddleCandidate != null) {
+        if (highScoreContainer != null && scoreCandidate != null && ballCandidate != null && paddleCandidate != null) {
             cachedArena = vg;
             cachedScoreView = scoreCandidate;
             cachedBallView = ballCandidate;
             cachedPaddleView = paddleCandidate;
+            cachedHighScoreContainer = highScoreContainer;
             return true;
         }
 
@@ -212,6 +247,28 @@ public class MainModule extends XposedModule {
         return false;
     }
 
+    private static boolean isLeaderboardOpen(Activity act) {
+        if (act == null) return false;
+        View root = act.getWindow().getDecorView();
+        return hasVisibleText(root, "Leaderboard");
+    }
+
+    private static boolean hasVisibleText(View v, String target) {
+        if (v == null || v.getVisibility() != View.VISIBLE) return false;
+        if (v instanceof TextView) {
+            CharSequence cs = ((TextView) v).getText();
+            if (cs != null && target.equals(cs.toString().trim())) {
+                return true;
+            }
+        } else if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                if (hasVisibleText(vg.getChildAt(i), target)) return true;
+            }
+        }
+        return false;
+    }
+
     private static void stepBot(Activity act) {
         int currentScore = parseScore(cachedScoreView);
         if (currentScore < 0) return;
@@ -226,6 +283,13 @@ public class MainModule extends XposedModule {
         cachedBallView.getLocationInWindow(ballLoc);
         float ballCenterX = ballLoc[0] + cachedBallView.getWidth() / 2f;
 
+        float dx = 0f;
+        if (prevBallCenterX >= 0f) {
+            dx = ballCenterX - prevBallCenterX;
+            if (Math.abs(dx) > 150f) dx = 0f;
+        }
+        prevBallCenterX = ballCenterX;
+
         int[] padLoc = new int[2];
         cachedPaddleView.getLocationInWindow(padLoc);
         float padY = padLoc[1] + cachedPaddleView.getHeight() / 2f;
@@ -233,8 +297,9 @@ public class MainModule extends XposedModule {
 
         float targetX;
         if (currentScore < targetScore) {
-            // Track ball X
-            targetX = Math.max(arenaLeft + padHalfW, Math.min(arenaLeft + arenaWidth - padHalfW, ballCenterX));
+            // Predict slightly ahead so high-speed bounces (score 68+) never lag
+            float predictedX = ballCenterX + dx * 0.85f;
+            targetX = Math.max(arenaLeft + padHalfW, Math.min(arenaLeft + arenaWidth - padHalfW, predictedX));
         } else {
             // Auto-lose: dodge to the opposite side from the ball
             float arenaCenterX = arenaLeft + arenaWidth / 2f;
@@ -246,16 +311,37 @@ public class MainModule extends XposedModule {
         }
 
         long now = SystemClock.uptimeMillis();
-        if (!touchDown) {
-            downTime = now;
-            MotionEvent down = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_DOWN, targetX, padY, 0);
+        dispatchingBotTouch = true;
+        try {
+            if (!touchDown) {
+                downTime = now;
+                MotionEvent down = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_DOWN, targetX, padY, 0);
+                act.dispatchTouchEvent(down);
+                down.recycle();
+                touchDown = true;
+            } else {
+                MotionEvent move = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_MOVE, targetX, padY, 0);
+                act.dispatchTouchEvent(move);
+                move.recycle();
+            }
+        } finally {
+            dispatchingBotTouch = false;
+        }
+    }
+
+    private static void dispatchTap(Activity act, float x, float y) {
+        if (act == null || act.isFinishing()) return;
+        long now = SystemClock.uptimeMillis();
+        dispatchingBotTouch = true;
+        try {
+            MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0);
             act.dispatchTouchEvent(down);
             down.recycle();
-            touchDown = true;
-        } else {
-            MotionEvent move = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_MOVE, targetX, padY, 0);
-            act.dispatchTouchEvent(move);
-            move.recycle();
+            MotionEvent up = MotionEvent.obtain(now, now + 20, MotionEvent.ACTION_UP, x, y, 0);
+            act.dispatchTouchEvent(up);
+            up.recycle();
+        } finally {
+            dispatchingBotTouch = false;
         }
     }
 
@@ -264,9 +350,14 @@ public class MainModule extends XposedModule {
         touchDown = false;
         if (act != null && !act.isFinishing()) {
             long now = SystemClock.uptimeMillis();
-            MotionEvent up = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_UP, 0f, 0f, 0);
-            act.dispatchTouchEvent(up);
-            up.recycle();
+            dispatchingBotTouch = true;
+            try {
+                MotionEvent up = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_UP, 0f, 0f, 0);
+                act.dispatchTouchEvent(up);
+                up.recycle();
+            } finally {
+                dispatchingBotTouch = false;
+            }
         }
     }
 
@@ -311,11 +402,22 @@ public class MainModule extends XposedModule {
     }
 
     private static void promptScore(Activity act) {
+        dialogOpen = true;
         releaseTouch(act);
+
+        // Open Leaderboard in background if in Emoji Pong so the game pauses
+        final boolean openedLeaderboard;
+        if (isArenaValid() && !isLeaderboardOpen(act) && cachedHighScoreContainer != null) {
+            cachedHighScoreContainer.performClick();
+            openedLeaderboard = true;
+        } else {
+            openedLeaderboard = false;
+        }
+
         EditText et = new EditText(act);
         et.setInputType(InputType.TYPE_CLASS_NUMBER);
         et.setText(String.valueOf(targetScore));
-        new AlertDialog.Builder(act)
+        AlertDialog dlg = new AlertDialog.Builder(act)
                 .setTitle("Auto-Play Target Score")
                 .setView(et)
                 .setPositiveButton("Set", (d, w) -> {
@@ -329,8 +431,21 @@ public class MainModule extends XposedModule {
                 .setNegativeButton("Off", (d, w) -> {
                     enabled = false;
                     releaseTouch(act);
+                    setKeepScreenOn(false);
                     Toast.makeText(act, "Auto-Play Off", Toast.LENGTH_SHORT).show();
                 })
-                .show();
+                .create();
+
+        dlg.setOnDismissListener(d -> {
+            dialogOpen = false;
+            if (openedLeaderboard && isLeaderboardOpen(act) && cachedArena != null) {
+                mainHandler.postDelayed(() -> {
+                    if (isLeaderboardOpen(act) && cachedArena != null) {
+                        dispatchTap(act, cachedArena.getWidth() / 2f, 250f);
+                    }
+                }, 80);
+            }
+        });
+        dlg.show();
     }
 }
