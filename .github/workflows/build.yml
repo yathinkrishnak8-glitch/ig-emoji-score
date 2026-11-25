@@ -10,23 +10,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone and Map libxposed Submodule
+      - name: Setup libxposed-api & Clean Unused Compat
         run: |
-          echo "=== .gitmodules ===" && cat .gitmodules
-          echo "=== settings.gradle.kts ===" && cat settings.gradle.kts
-          
-          SUB_URL=$(git config -f .gitmodules --get-regexp url | awk '{print $2}' | head -n 1)
-          rm -rf libxposed-api libxposed-compat libxposed-tmp
-          git clone --depth 1 "${SUB_URL:-https://github.com/libxposed/api.git}" libxposed-tmp
-          
-          # Populate libxposed-api with the full cloned repo
-          cp -r libxposed-tmp libxposed-api
-          
-          # Also satisfy root-level libxposed-compat if settings.gradle.kts points there
-          COMPAT_PATH=$(find libxposed-tmp -maxdepth 3 -name "build.gradle*" -path "*compat*" -exec dirname {} \; | head -n 1)
-          if [ -n "$COMPAT_PATH" ]; then
-            cp -r "$COMPAT_PATH" libxposed-compat
-          fi
+          rm -rf libxposed-api
+          git clone --depth 1 https://github.com/libxposed/api.git libxposed-api
+          sed -i '/compat/d' settings.gradle.kts app/build.gradle.kts
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
