@@ -11,6 +11,7 @@ import android.text.InputType;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.EditText;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -18,10 +19,7 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.util.Arrays;
 import java.util.Deque;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -32,11 +30,10 @@ import io.github.libxposed.api.XposedModule;
 public class MainModule extends XposedModule {
 
     private static final String TAG = "IG-Emoji-Score";
-    private static final int MAX_LOG_LINES = 200;
+    private static final int MAX_LOG_LINES = 250;
     private static volatile int targetScore = 99;
     private static volatile boolean enabled = true;
-    private static volatile boolean autoPopupScheduled = false;
-    private static final Set<String> checkedClasses = ConcurrentHashMap.newKeySet();
+    private static volatile long captureUntilMs = 0;
     private static final Set<String> seenActivities = ConcurrentHashMap.newKeySet();
     private static final Deque<String> logBuffer = new ConcurrentLinkedDeque<>();
     private static volatile Activity activeActivity = null;
@@ -52,6 +49,10 @@ public class MainModule extends XposedModule {
         } catch (Throwable ignored) {}
     }
 
+    private boolean isCapturing() {
+        return System.currentTimeMillis() < captureUntilMs;
+    }
+
     @Override
     public void onPackageReady(@NonNull PackageReadyParam param) {
         if (!"com.instagram.android".equals(param.getPackageName())) return;
@@ -60,7 +61,7 @@ public class MainModule extends XposedModule {
         addLog("onPackageReady: hooking com.instagram.android");
 
         try {
-            // 1. Track active Activity & bind Volume Up to open custom score prompt
+            // 1. Track active Activity & bind Volume Up to open menu
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             hook(onResume).intercept(chain -> {
                 Object result = chain.proceed();
@@ -84,27 +85,23 @@ public class MainModule extends XposedModule {
                 return chain.proceed();
             });
 
-            // 2. Catch & log Emoji Pong View when attached to window
-            Method onAttached = View.class.getDeclaredMethod("onAttachedToWindow");
-            hook(onAttached).intercept(chain -> {
-                Object result = chain.proceed();
-                Object view = chain.getThisObject();
-                if (view != null) {
-                    Class<?> c = view.getClass();
-                    if (checkedClasses.add(c.getName())) {
-                        String low = c.getName().toLowerCase();
-                        boolean nameMatch = low.contains("pong") || low.contains("emoji_game") || low.contains("emojipong");
-                        if (nameMatch || looksLikePongView(c)) {
-                            dumpClassInfo(c);
-                            hookPongMethods(c);
-                            scheduleAutoLogPopup();
+            // 2. Capture TextView.setText during 5s window to find score updates
+            Method setText = TextView.class.getDeclaredMethod("setText", CharSequence.class, TextView.BufferType.class);
+            hook(setText).intercept(chain -> {
+                if (isCapturing()) {
+                    CharSequence cs = (CharSequence) chain.getArg(0);
+                    if (cs != null && cs.length() > 0 && cs.length() <= 24) {
+                        String s = cs.toString().trim();
+                        if (s.matches("\\d+") || s.toLowerCase().contains("score") || s.toLowerCase().contains("best")) {
+                            addLog("TextView.setText(\"" + s + "\") on " + chain.getThisObject().getClass().getName()
+                                    + " caller=" + getAppCaller());
                         }
                     }
                 }
-                return result;
+                return chain.proceed();
             });
 
-            // 3. Log & override local SharedPreferences high score writes
+            // 3. Capture & override SharedPreferences writes
             Class<?> editor = cl.loadClass("android.app.SharedPreferencesImpl$EditorImpl");
             Method putInt = editor.getDeclaredMethod("putInt", String.class, int.class);
             hook(putInt).intercept(chain -> {
@@ -112,7 +109,7 @@ public class MainModule extends XposedModule {
                 int val = (int) chain.getArg(1);
                 if (key != null) {
                     String low = key.toLowerCase();
-                    if (low.contains("pong") || low.contains("emoji") || low.contains("score")) {
+                    if (isCapturing() || low.contains("pong") || low.contains("emoji") || low.contains("score")) {
                         addLog("Prefs.putInt: key=" + key + " val=" + val);
                     }
                     if (enabled && (low.contains("emoji_pong") || low.contains("pong_high_score")
@@ -130,7 +127,7 @@ public class MainModule extends XposedModule {
                 long val = (long) chain.getArg(1);
                 if (key != null) {
                     String low = key.toLowerCase();
-                    if (low.contains("pong") || low.contains("emoji") || low.contains("score")) {
+                    if (isCapturing() || low.contains("pong") || low.contains("emoji") || low.contains("score")) {
                         addLog("Prefs.putLong: key=" + key + " val=" + val);
                     }
                     if (enabled && (low.contains("emoji_pong") || low.contains("pong_high_score")
@@ -147,105 +144,62 @@ public class MainModule extends XposedModule {
         }
     }
 
-    private void scheduleAutoLogPopup() {
-        if (autoPopupScheduled) return;
-        autoPopupScheduled = true;
-        mainHandler.postDelayed(() -> {
-            Activity act = activeActivity;
-            if (act != null && !act.isFinishing()) {
-                showLogsDialog(act);
-            }
-        }, 5000);
-    }
-
-    private static boolean looksLikePongView(Class<?> c) {
-        String low = c.getName().toLowerCase();
-        if (low.contains("emojipong") || low.contains("emoji_pong")) return true;
-        if (!c.getName().startsWith("X.")) return false;
-        int floats = 0, ints = 0;
-        boolean gfx = false;
-        for (Field f : c.getDeclaredFields()) {
-            Class<?> t = f.getType();
-            if (t == float.class) floats++;
-            else if (t == int.class) ints++;
-            else {
-                String tn = t.getName();
-                if (tn.contains("Paint") || tn.contains("RectF") || tn.contains("Animator")
-                        || tn.contains("Canvas") || tn.contains("Path") || tn.contains("Drawable")
-                        || tn.contains("Bitmap")) {
-                    gfx = true;
-                }
+    private static String getAppCaller() {
+        StackTraceElement[] st = Thread.currentThread().getStackTrace();
+        for (StackTraceElement el : st) {
+            String cn = el.getClassName();
+            if (cn.startsWith("X.") || cn.startsWith("com.instagram.")) {
+                return cn + "." + el.getMethodName() + ":" + el.getLineNumber();
             }
         }
-        return (gfx && floats >= 2 && ints >= 1 && ints <= 15) || floats >= 4;
+        return "?";
     }
 
-    private void dumpClassInfo(Class<?> c) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("PongCandidate class=").append(c.getName())
-                .append(" super=").append(c.getSuperclass() != null ? c.getSuperclass().getName() : "null")
-                .append("\nFields:");
-        for (Field f : c.getDeclaredFields()) {
-            sb.append(" ").append(f.getType().getSimpleName()).append(":").append(f.getName());
+    private void dumpViewHierarchy(Activity act) {
+        try {
+            View root = act.getWindow().getDecorView();
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== ViewTree (").append(act.getClass().getSimpleName()).append(") ===\n");
+            walkView(root, 0, sb, new int[]{0});
+            addLog(sb.toString());
+        } catch (Throwable t) {
+            addLog("dumpViewHierarchy err: " + t.getMessage());
         }
-        sb.append("\nMethods:");
-        for (Method m : c.getDeclaredMethods()) {
-            sb.append(" ").append(m.getReturnType().getSimpleName()).append(" ")
-                    .append(m.getName()).append(Arrays.toString(m.getParameterTypes()));
-        }
-        addLog(sb.toString());
     }
 
-    private void hookPongMethods(Class<?> c) {
-        for (Method m : c.getDeclaredMethods()) {
-            if (Modifier.isAbstract(m.getModifiers())) continue;
-            Class<?>[] p = m.getParameterTypes();
-            try {
-                if (p.length == 1 && p[0] == int.class) {
-                    hook(m).intercept(chain -> {
-                        int arg = (int) chain.getArg(0);
-                        addLog(c.getName() + "." + m.getName() + "(int=" + arg + ")");
-                        if (enabled && arg > 0) {
-                            return chain.proceed(new Object[]{targetScore});
-                        }
-                        return chain.proceed();
-                    });
-                } else if (p.length == 2 && p[0] == String.class && p[1] == int.class) {
-                    hook(m).intercept(chain -> {
-                        int arg = (int) chain.getArg(1);
-                        addLog(c.getName() + "." + m.getName() + "(str=" + chain.getArg(0) + ", int=" + arg + ")");
-                        if (enabled && arg > 0) {
-                            return chain.proceed(new Object[]{chain.getArg(0), targetScore});
-                        }
-                        return chain.proceed();
-                    });
-                } else if (p.length == 0 && m.getReturnType() == void.class) {
-                    hook(m).intercept(chain -> {
-                        Object obj = chain.getThisObject();
-                        if (enabled && obj != null) {
-                            for (Field f : obj.getClass().getDeclaredFields()) {
-                                if (Modifier.isStatic(f.getModifiers()) || f.getType() != int.class) continue;
-                                try {
-                                    f.setAccessible(true);
-                                    int cur = f.getInt(obj);
-                                    if (cur > 0 && cur < 400) {
-                                        addLog(c.getName() + "." + m.getName() + "() field " + f.getName() + "=" + cur + " -> " + targetScore);
-                                        f.setInt(obj, targetScore);
-                                    }
-                                } catch (Throwable ignored) {}
-                            }
-                        }
-                        return chain.proceed();
-                    });
-                }
-            } catch (Throwable ignored) {}
+    private void walkView(View v, int depth, StringBuilder sb, int[] count) {
+        if (v == null || v.getVisibility() != View.VISIBLE || count[0] >= 80) return;
+        if (v.getWidth() == 0 && v.getHeight() == 0 && depth > 2) return;
+        count[0]++;
+
+        for (int i = 0; i < depth; i++) sb.append(" ");
+        sb.append(v.getClass().getName())
+                .append(" [").append(v.getWidth()).append("x").append(v.getHeight()).append("]");
+        if (v.getTranslationX() != 0f || v.getTranslationY() != 0f) {
+            sb.append(" tx=").append((int) v.getTranslationX()).append(" ty=").append((int) v.getTranslationY());
+        }
+        if (v instanceof TextView) {
+            CharSequence t = ((TextView) v).getText();
+            if (t != null && t.length() > 0) {
+                String s = t.toString().replace("\n", " ");
+                if (s.length() > 20) s = s.substring(0, 20) + "...";
+                sb.append(" \"").append(s).append("\"");
+            }
+        }
+        sb.append("\n");
+
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                walkView(vg.getChildAt(i), depth + 1, sb, count);
+            }
         }
     }
 
     private static void showLogsDialog(Activity act) {
         StringBuilder sb = new StringBuilder();
         for (String line : logBuffer) {
-            sb.append(line).append("\n\n");
+            sb.append(line).append("\n");
         }
         String text = sb.length() > 0 ? sb.toString() : "(No logs captured yet)";
 
@@ -253,8 +207,8 @@ public class MainModule extends XposedModule {
         TextView tv = new TextView(act);
         tv.setText(text);
         tv.setTextIsSelectable(true);
-        tv.setTextSize(11f);
-        int pad = 32;
+        tv.setTextSize(10f);
+        int pad = 28;
         tv.setPadding(pad, pad, pad, pad);
         scroll.addView(tv);
 
@@ -273,7 +227,7 @@ public class MainModule extends XposedModule {
                 .show();
     }
 
-    private static void promptScore(Activity act) {
+    private void promptScore(Activity act) {
         EditText et = new EditText(act);
         et.setInputType(InputType.TYPE_CLASS_NUMBER);
         et.setText(String.valueOf(targetScore));
@@ -288,7 +242,9 @@ public class MainModule extends XposedModule {
                     } catch (NumberFormatException ignored) {}
                 })
                 .setNeutralButton("Logs (5s)", (d, w) -> {
-                    Toast.makeText(act, "Showing logs in 5s...", Toast.LENGTH_SHORT).show();
+                    captureUntilMs = System.currentTimeMillis() + 5000;
+                    dumpViewHierarchy(act);
+                    Toast.makeText(act, "Capturing 5s...", Toast.LENGTH_SHORT).show();
                     mainHandler.postDelayed(() -> {
                         Activity cur = activeActivity;
                         if (cur != null && !cur.isFinishing()) {
