@@ -10,10 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch libxposed-api
+      - name: Fetch libxposed submodule
         run: |
-          rm -rf libxposed-api
-          git clone --depth 1 https://github.com/libxposed/api.git libxposed-api
+          cat .gitmodules
+          cat settings.gradle.kts
+          rm -rf libxposed libxposed-api
+          git clone --depth 1 https://github.com/libxposed/api.git libxposed
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
