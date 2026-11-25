@@ -2,12 +2,18 @@ package com.example.module;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.widget.EditText;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
@@ -16,26 +22,42 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 import io.github.libxposed.api.XposedModule;
 
 public class MainModule extends XposedModule {
 
     private static final String TAG = "IG-Emoji-Score";
+    private static final int MAX_LOG_LINES = 200;
     private static volatile int targetScore = 99;
     private static volatile boolean enabled = true;
+    private static volatile boolean autoPopupScheduled = false;
     private static final Set<String> checkedClasses = ConcurrentHashMap.newKeySet();
     private static final Set<String> seenActivities = ConcurrentHashMap.newKeySet();
+    private static final Deque<String> logBuffer = new ConcurrentLinkedDeque<>();
     private static volatile Activity activeActivity = null;
+    private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private void addLog(String msg) {
+        logBuffer.addLast(msg);
+        while (logBuffer.size() > MAX_LOG_LINES) {
+            logBuffer.pollFirst();
+        }
+        try {
+            log(Log.INFO, TAG, msg);
+        } catch (Throwable ignored) {}
+    }
 
     @Override
     public void onPackageReady(@NonNull PackageReadyParam param) {
         if (!"com.instagram.android".equals(param.getPackageName())) return;
 
         ClassLoader cl = param.getClassLoader();
-        log(Log.INFO, TAG, "onPackageReady: hooking com.instagram.android");
+        addLog("onPackageReady: hooking com.instagram.android");
 
         try {
             // 1. Track active Activity & bind Volume Up to open custom score prompt
@@ -45,7 +67,7 @@ public class MainModule extends XposedModule {
                 Activity act = (Activity) chain.getThisObject();
                 activeActivity = act;
                 if (act != null && seenActivities.add(act.getClass().getName())) {
-                    log(Log.INFO, TAG, "Activity resumed: " + act.getClass().getName());
+                    addLog("Activity resumed: " + act.getClass().getName());
                 }
                 return result;
             });
@@ -75,6 +97,7 @@ public class MainModule extends XposedModule {
                         if (nameMatch || looksLikePongView(c)) {
                             dumpClassInfo(c);
                             hookPongMethods(c);
+                            scheduleAutoLogPopup();
                         }
                     }
                 }
@@ -90,11 +113,11 @@ public class MainModule extends XposedModule {
                 if (key != null) {
                     String low = key.toLowerCase();
                     if (low.contains("pong") || low.contains("emoji") || low.contains("score")) {
-                        log(Log.INFO, TAG, "Prefs.putInt: key=" + key + " val=" + val);
+                        addLog("Prefs.putInt: key=" + key + " val=" + val);
                     }
                     if (enabled && (low.contains("emoji_pong") || low.contains("pong_high_score")
                             || (low.contains("pong") && low.contains("score")))) {
-                        log(Log.INFO, TAG, "Prefs.putInt OVERRIDE: " + key + " -> " + targetScore);
+                        addLog("Prefs.putInt OVERRIDE: " + key + " -> " + targetScore);
                         return chain.proceed(new Object[]{key, targetScore});
                     }
                 }
@@ -108,11 +131,11 @@ public class MainModule extends XposedModule {
                 if (key != null) {
                     String low = key.toLowerCase();
                     if (low.contains("pong") || low.contains("emoji") || low.contains("score")) {
-                        log(Log.INFO, TAG, "Prefs.putLong: key=" + key + " val=" + val);
+                        addLog("Prefs.putLong: key=" + key + " val=" + val);
                     }
                     if (enabled && (low.contains("emoji_pong") || low.contains("pong_high_score")
                             || (low.contains("pong") && low.contains("score")))) {
-                        log(Log.INFO, TAG, "Prefs.putLong OVERRIDE: " + key + " -> " + targetScore);
+                        addLog("Prefs.putLong OVERRIDE: " + key + " -> " + targetScore);
                         return chain.proceed(new Object[]{key, (long) targetScore});
                     }
                 }
@@ -120,8 +143,19 @@ public class MainModule extends XposedModule {
             });
 
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "Hook setup error", t);
+            addLog("Hook setup error: " + t.getMessage());
         }
+    }
+
+    private void scheduleAutoLogPopup() {
+        if (autoPopupScheduled) return;
+        autoPopupScheduled = true;
+        mainHandler.postDelayed(() -> {
+            Activity act = activeActivity;
+            if (act != null && !act.isFinishing()) {
+                showLogsDialog(act);
+            }
+        }, 5000);
     }
 
     private static boolean looksLikePongView(Class<?> c) {
@@ -143,7 +177,7 @@ public class MainModule extends XposedModule {
                 }
             }
         }
-        return gfx && floats >= 2 && ints >= 1 && ints <= 15;
+        return (gfx && floats >= 2 && ints >= 1 && ints <= 15) || floats >= 4;
     }
 
     private void dumpClassInfo(Class<?> c) {
@@ -159,7 +193,7 @@ public class MainModule extends XposedModule {
             sb.append(" ").append(m.getReturnType().getSimpleName()).append(" ")
                     .append(m.getName()).append(Arrays.toString(m.getParameterTypes()));
         }
-        log(Log.INFO, TAG, sb.toString());
+        addLog(sb.toString());
     }
 
     private void hookPongMethods(Class<?> c) {
@@ -170,7 +204,7 @@ public class MainModule extends XposedModule {
                 if (p.length == 1 && p[0] == int.class) {
                     hook(m).intercept(chain -> {
                         int arg = (int) chain.getArg(0);
-                        log(Log.INFO, TAG, c.getName() + "." + m.getName() + "(int=" + arg + ")");
+                        addLog(c.getName() + "." + m.getName() + "(int=" + arg + ")");
                         if (enabled && arg > 0) {
                             return chain.proceed(new Object[]{targetScore});
                         }
@@ -179,7 +213,7 @@ public class MainModule extends XposedModule {
                 } else if (p.length == 2 && p[0] == String.class && p[1] == int.class) {
                     hook(m).intercept(chain -> {
                         int arg = (int) chain.getArg(1);
-                        log(Log.INFO, TAG, c.getName() + "." + m.getName() + "(str=" + chain.getArg(0) + ", int=" + arg + ")");
+                        addLog(c.getName() + "." + m.getName() + "(str=" + chain.getArg(0) + ", int=" + arg + ")");
                         if (enabled && arg > 0) {
                             return chain.proceed(new Object[]{chain.getArg(0), targetScore});
                         }
@@ -195,7 +229,7 @@ public class MainModule extends XposedModule {
                                     f.setAccessible(true);
                                     int cur = f.getInt(obj);
                                     if (cur > 0 && cur < 400) {
-                                        log(Log.INFO, TAG, c.getName() + "." + m.getName() + "() field " + f.getName() + "=" + cur + " -> " + targetScore);
+                                        addLog(c.getName() + "." + m.getName() + "() field " + f.getName() + "=" + cur + " -> " + targetScore);
                                         f.setInt(obj, targetScore);
                                     }
                                 } catch (Throwable ignored) {}
@@ -208,19 +242,59 @@ public class MainModule extends XposedModule {
         }
     }
 
-    private static void promptScore(Context ctx) {
-        EditText et = new EditText(ctx);
+    private static void showLogsDialog(Activity act) {
+        StringBuilder sb = new StringBuilder();
+        for (String line : logBuffer) {
+            sb.append(line).append("\n\n");
+        }
+        String text = sb.length() > 0 ? sb.toString() : "(No logs captured yet)";
+
+        ScrollView scroll = new ScrollView(act);
+        TextView tv = new TextView(act);
+        tv.setText(text);
+        tv.setTextIsSelectable(true);
+        tv.setTextSize(11f);
+        int pad = 32;
+        tv.setPadding(pad, pad, pad, pad);
+        scroll.addView(tv);
+
+        new AlertDialog.Builder(act)
+                .setTitle("IG-Emoji-Score Logs")
+                .setView(scroll)
+                .setPositiveButton("Copy", (d, w) -> {
+                    ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+                    if (cm != null) {
+                        cm.setPrimaryClip(ClipData.newPlainText("IG-Emoji-Score Logs", text));
+                        Toast.makeText(act, "Logs copied!", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNeutralButton("Clear", (d, w) -> logBuffer.clear())
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private static void promptScore(Activity act) {
+        EditText et = new EditText(act);
         et.setInputType(InputType.TYPE_CLASS_NUMBER);
         et.setText(String.valueOf(targetScore));
-        new AlertDialog.Builder(ctx)
+        new AlertDialog.Builder(act)
                 .setTitle("Custom Emoji Score")
                 .setView(et)
                 .setPositiveButton("Set", (d, w) -> {
                     try {
                         targetScore = Integer.parseInt(et.getText().toString().trim());
                         enabled = true;
-                        Toast.makeText(ctx, "Target: " + targetScore, Toast.LENGTH_SHORT).show();
+                        Toast.makeText(act, "Target: " + targetScore, Toast.LENGTH_SHORT).show();
                     } catch (NumberFormatException ignored) {}
+                })
+                .setNeutralButton("Logs (5s)", (d, w) -> {
+                    Toast.makeText(act, "Showing logs in 5s...", Toast.LENGTH_SHORT).show();
+                    mainHandler.postDelayed(() -> {
+                        Activity cur = activeActivity;
+                        if (cur != null && !cur.isFinishing()) {
+                            showLogsDialog(cur);
+                        }
+                    }, 5000);
                 })
                 .setNegativeButton("Off", (d, w) -> enabled = false)
                 .show();
