@@ -15,6 +15,7 @@ import androidx.annotation.NonNull;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -26,6 +27,7 @@ public class MainModule extends XposedModule {
     private static volatile int targetScore = 99;
     private static volatile boolean enabled = true;
     private static final Set<String> checkedClasses = ConcurrentHashMap.newKeySet();
+    private static final Set<String> seenActivities = ConcurrentHashMap.newKeySet();
     private static volatile Activity activeActivity = null;
 
     @Override
@@ -33,13 +35,18 @@ public class MainModule extends XposedModule {
         if (!"com.instagram.android".equals(param.getPackageName())) return;
 
         ClassLoader cl = param.getClassLoader();
+        log(Log.INFO, TAG, "onPackageReady: hooking com.instagram.android");
 
         try {
             // 1. Track active Activity & bind Volume Up to open custom score prompt
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             hook(onResume).intercept(chain -> {
                 Object result = chain.proceed();
-                activeActivity = (Activity) chain.getThisObject();
+                Activity act = (Activity) chain.getThisObject();
+                activeActivity = act;
+                if (act != null && seenActivities.add(act.getClass().getName())) {
+                    log(Log.INFO, TAG, "Activity resumed: " + act.getClass().getName());
+                }
                 return result;
             });
 
@@ -55,27 +62,59 @@ public class MainModule extends XposedModule {
                 return chain.proceed();
             });
 
-            // 2. Catch Emoji Pong View when attached to window
+            // 2. Catch & log Emoji Pong View when attached to window
             Method onAttached = View.class.getDeclaredMethod("onAttachedToWindow");
             hook(onAttached).intercept(chain -> {
                 Object result = chain.proceed();
                 Object view = chain.getThisObject();
                 if (view != null) {
                     Class<?> c = view.getClass();
-                    if (checkedClasses.add(c.getName()) && looksLikePongView(c)) {
-                        hookPongMethods(c);
+                    if (checkedClasses.add(c.getName())) {
+                        String low = c.getName().toLowerCase();
+                        boolean nameMatch = low.contains("pong") || low.contains("emoji_game") || low.contains("emojipong");
+                        if (nameMatch || looksLikePongView(c)) {
+                            dumpClassInfo(c);
+                            hookPongMethods(c);
+                        }
                     }
                 }
                 return result;
             });
 
-            // 3. Override local SharedPreferences high score writes
+            // 3. Log & override local SharedPreferences high score writes
             Class<?> editor = cl.loadClass("android.app.SharedPreferencesImpl$EditorImpl");
             Method putInt = editor.getDeclaredMethod("putInt", String.class, int.class);
             hook(putInt).intercept(chain -> {
                 String key = (String) chain.getArg(0);
-                if (enabled && key != null && (key.contains("emoji_pong") || key.contains("pong_high_score"))) {
-                    return chain.proceed(new Object[]{key, targetScore});
+                int val = (int) chain.getArg(1);
+                if (key != null) {
+                    String low = key.toLowerCase();
+                    if (low.contains("pong") || low.contains("emoji") || low.contains("score")) {
+                        log(Log.INFO, TAG, "Prefs.putInt: key=" + key + " val=" + val);
+                    }
+                    if (enabled && (low.contains("emoji_pong") || low.contains("pong_high_score")
+                            || (low.contains("pong") && low.contains("score")))) {
+                        log(Log.INFO, TAG, "Prefs.putInt OVERRIDE: " + key + " -> " + targetScore);
+                        return chain.proceed(new Object[]{key, targetScore});
+                    }
+                }
+                return chain.proceed();
+            });
+
+            Method putLong = editor.getDeclaredMethod("putLong", String.class, long.class);
+            hook(putLong).intercept(chain -> {
+                String key = (String) chain.getArg(0);
+                long val = (long) chain.getArg(1);
+                if (key != null) {
+                    String low = key.toLowerCase();
+                    if (low.contains("pong") || low.contains("emoji") || low.contains("score")) {
+                        log(Log.INFO, TAG, "Prefs.putLong: key=" + key + " val=" + val);
+                    }
+                    if (enabled && (low.contains("emoji_pong") || low.contains("pong_high_score")
+                            || (low.contains("pong") && low.contains("score")))) {
+                        log(Log.INFO, TAG, "Prefs.putLong OVERRIDE: " + key + " -> " + targetScore);
+                        return chain.proceed(new Object[]{key, (long) targetScore});
+                    }
                 }
                 return chain.proceed();
             });
@@ -95,11 +134,32 @@ public class MainModule extends XposedModule {
             Class<?> t = f.getType();
             if (t == float.class) floats++;
             else if (t == int.class) ints++;
-            else if (t.getName().contains("Paint") || t.getName().contains("RectF") || t.getName().contains("Animator")) {
-                gfx = true;
+            else {
+                String tn = t.getName();
+                if (tn.contains("Paint") || tn.contains("RectF") || tn.contains("Animator")
+                        || tn.contains("Canvas") || tn.contains("Path") || tn.contains("Drawable")
+                        || tn.contains("Bitmap")) {
+                    gfx = true;
+                }
             }
         }
-        return gfx && floats >= 4 && ints >= 1 && ints <= 6;
+        return gfx && floats >= 2 && ints >= 1 && ints <= 15;
+    }
+
+    private void dumpClassInfo(Class<?> c) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("PongCandidate class=").append(c.getName())
+                .append(" super=").append(c.getSuperclass() != null ? c.getSuperclass().getName() : "null")
+                .append("\nFields:");
+        for (Field f : c.getDeclaredFields()) {
+            sb.append(" ").append(f.getType().getSimpleName()).append(":").append(f.getName());
+        }
+        sb.append("\nMethods:");
+        for (Method m : c.getDeclaredMethods()) {
+            sb.append(" ").append(m.getReturnType().getSimpleName()).append(" ")
+                    .append(m.getName()).append(Arrays.toString(m.getParameterTypes()));
+        }
+        log(Log.INFO, TAG, sb.toString());
     }
 
     private void hookPongMethods(Class<?> c) {
@@ -110,6 +170,7 @@ public class MainModule extends XposedModule {
                 if (p.length == 1 && p[0] == int.class) {
                     hook(m).intercept(chain -> {
                         int arg = (int) chain.getArg(0);
+                        log(Log.INFO, TAG, c.getName() + "." + m.getName() + "(int=" + arg + ")");
                         if (enabled && arg > 0) {
                             return chain.proceed(new Object[]{targetScore});
                         }
@@ -118,6 +179,7 @@ public class MainModule extends XposedModule {
                 } else if (p.length == 2 && p[0] == String.class && p[1] == int.class) {
                     hook(m).intercept(chain -> {
                         int arg = (int) chain.getArg(1);
+                        log(Log.INFO, TAG, c.getName() + "." + m.getName() + "(str=" + chain.getArg(0) + ", int=" + arg + ")");
                         if (enabled && arg > 0) {
                             return chain.proceed(new Object[]{chain.getArg(0), targetScore});
                         }
@@ -133,6 +195,7 @@ public class MainModule extends XposedModule {
                                     f.setAccessible(true);
                                     int cur = f.getInt(obj);
                                     if (cur > 0 && cur < 400) {
+                                        log(Log.INFO, TAG, c.getName() + "." + m.getName() + "() field " + f.getName() + "=" + cur + " -> " + targetScore);
                                         f.setInt(obj, targetScore);
                                     }
                                 } catch (Throwable ignored) {}
