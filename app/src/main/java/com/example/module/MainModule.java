@@ -5,6 +5,9 @@ import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.StrictMode;
@@ -17,6 +20,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -34,6 +38,7 @@ public class MainModule extends XposedModule {
 
     private static final String TAG = "IG-Emoji-Score";
     private static final String MODAL_ACTIVITY = "com.instagram.modal.ModalActivity";
+    private static final String TOGGLE_TAG = "ig_emoji_auto_toggle";
     private static final int MAX_LOG_LINES = 150;
     private static volatile int targetScore = 99;
     private static volatile boolean enabled = true;
@@ -55,6 +60,7 @@ public class MainModule extends XposedModule {
     private static TextView cachedBallView = null;
     private static View cachedPaddleView = null;
     private static View cachedHighScoreContainer = null;
+    private static TextView cachedToggleBtn = null;
 
     private void addLog(String msg) {
         logBuffer.addLast(msg);
@@ -107,7 +113,19 @@ public class MainModule extends XposedModule {
                     .intercept(chain -> {
                         if (!dispatchingBotTouch && enabled && !dialogOpen && isModalActivity(activeActivity) && isArenaValid()) {
                             Activity act = activeActivity;
-                            if (act != null && !isLeaderboardOpen(act) && SystemClock.uptimeMillis() >= resumeAfterMs) {
+                            MotionEvent ev = (MotionEvent) chain.getArg(0);
+                            if (act != null && ev != null && !isLeaderboardOpen(act) && SystemClock.uptimeMillis() >= resumeAfterMs) {
+                                int[] arenaLoc = new int[2];
+                                cachedArena.getLocationInWindow(arenaLoc);
+                                float topBarBottom = arenaLoc[1] + 280f;
+                                if (ev.getRawY() < topBarBottom) {
+                                    // Allow top-bar taps (Leaderboard, Auto-Play toggle, Close)
+                                    if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                                        releaseTouch(act);
+                                        resumeAfterMs = SystemClock.uptimeMillis() + 250;
+                                    }
+                                    return chain.proceed();
+                                }
                                 int score = parseScore(cachedScoreView);
                                 if (score >= 0 && score < targetScore) {
                                     return true;
@@ -170,11 +188,13 @@ public class MainModule extends XposedModule {
         prevBallCenterX = -1f;
         releaseTouch(activeActivity);
         setKeepScreenOn(false);
+        hideToggleButton();
         cachedArena = null;
         cachedScoreView = null;
         cachedBallView = null;
         cachedPaddleView = null;
         cachedHighScoreContainer = null;
+        cachedToggleBtn = null;
     }
 
     private static void startBotLoop() {
@@ -188,35 +208,44 @@ public class MainModule extends XposedModule {
                 if (!loopRunning) return;
                 try {
                     Activity act = activeActivity;
-                    if (enabled && !dialogOpen && isModalActivity(act) && !act.isFinishing()) {
+                    if (isModalActivity(act) && !act.isFinishing()) {
                         long nowMs = SystemClock.uptimeMillis();
                         if (!isArenaValid() && nowMs - lastScanMs >= 200) {
                             lastScanMs = nowMs;
                             findPongViews(act.getWindow().getDecorView());
                         }
                         if (isArenaValid()) {
-                            setKeepScreenOn(true);
-                            if (isLeaderboardOpen(act)) {
-                                wasLeaderboardOpen = true;
-                                prevBallCenterX = -1f;
-                                releaseTouch(act);
-                            } else {
-                                if (wasLeaderboardOpen) {
-                                    wasLeaderboardOpen = false;
-                                    resumeAfterMs = nowMs + 300;
+                            ensureToggleButton(act);
+                            if (enabled && !dialogOpen) {
+                                setKeepScreenOn(true);
+                                if (isLeaderboardOpen(act)) {
+                                    wasLeaderboardOpen = true;
                                     prevBallCenterX = -1f;
                                     releaseTouch(act);
+                                } else {
+                                    if (wasLeaderboardOpen) {
+                                        wasLeaderboardOpen = false;
+                                        resumeAfterMs = nowMs + 300;
+                                        prevBallCenterX = -1f;
+                                        releaseTouch(act);
+                                    }
+                                    if (nowMs >= resumeAfterMs) {
+                                        stepBot(act);
+                                    }
                                 }
-                                if (nowMs >= resumeAfterMs) {
-                                    stepBot(act);
-                                }
+                            } else {
+                                prevBallCenterX = -1f;
+                                releaseTouch(act);
+                                setKeepScreenOn(false);
                             }
                         } else {
+                            hideToggleButton();
                             prevBallCenterX = -1f;
                             releaseTouch(act);
                             setKeepScreenOn(false);
                         }
                     } else {
+                        hideToggleButton();
                         prevBallCenterX = -1f;
                         releaseTouch(act);
                         setKeepScreenOn(false);
@@ -227,6 +256,85 @@ public class MainModule extends XposedModule {
                 }
             }
         });
+    }
+
+    private static void ensureToggleButton(Activity act) {
+        if (cachedArena == null || cachedHighScoreContainer == null) return;
+        if (!(cachedArena.getParent() instanceof ViewGroup)) return;
+        ViewGroup parent = (ViewGroup) cachedArena.getParent();
+
+        TextView btn = cachedToggleBtn;
+        if (btn == null || !btn.isAttachedToWindow()) {
+            View existing = parent.findViewWithTag(TOGGLE_TAG);
+            if (existing instanceof TextView) {
+                btn = (TextView) existing;
+            } else {
+                btn = new TextView(act);
+                btn.setTag(TOGGLE_TAG);
+                btn.setTextSize(12f);
+                btn.setTypeface(Typeface.DEFAULT_BOLD);
+                btn.setTextColor(Color.WHITE);
+                btn.setPadding(24, 12, 24, 12);
+                btn.setElevation(12f);
+                btn.setOnClickListener(v -> {
+                    enabled = !enabled;
+                    updateToggleStyle(cachedToggleBtn);
+                    if (!enabled) {
+                        releaseTouch(act);
+                        setKeepScreenOn(false);
+                    } else {
+                        prevBallCenterX = -1f;
+                    }
+                    Toast.makeText(act, enabled ? "Auto-Play ON (" + targetScore + ")" : "Auto-Play OFF", Toast.LENGTH_SHORT).show();
+                });
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                parent.addView(btn, lp);
+            }
+            cachedToggleBtn = btn;
+        }
+
+        updateToggleStyle(btn);
+        btn.setVisibility(View.VISIBLE);
+
+        if (btn.getWidth() == 0) {
+            btn.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+        }
+        int btnW = btn.getWidth() > 0 ? btn.getWidth() : btn.getMeasuredWidth();
+        int btnH = btn.getHeight() > 0 ? btn.getHeight() : btn.getMeasuredHeight();
+
+        int[] hiLoc = new int[2];
+        int[] parentLoc = new int[2];
+        cachedHighScoreContainer.getLocationInWindow(hiLoc);
+        parent.getLocationInWindow(parentLoc);
+
+        float hiLeftInParent = hiLoc[0] - parentLoc[0];
+        float hiTopInParent = hiLoc[1] - parentLoc[1];
+        int hiH = cachedHighScoreContainer.getHeight();
+
+        btn.setX(Math.max(16f, hiLeftInParent - btnW - 20f));
+        btn.setY(Math.max(16f, hiTopInParent + (hiH - btnH) / 2f));
+    }
+
+    private static void updateToggleStyle(TextView btn) {
+        if (btn == null) return;
+        String label = enabled ? "Auto: ON" : "Auto: OFF";
+        if (!label.contentEquals(btn.getText())) {
+            btn.setText(label);
+        }
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(40f);
+        bg.setColor(enabled ? Color.parseColor("#CC16A34A") : Color.parseColor("#CCDC2626"));
+        btn.setBackground(bg);
+    }
+
+    private static void hideToggleButton() {
+        try {
+            if (cachedToggleBtn != null) {
+                cachedToggleBtn.setVisibility(View.GONE);
+            }
+        } catch (Throwable ignored) {}
     }
 
     private static void setKeepScreenOn(boolean keepOn) {
@@ -523,12 +631,14 @@ public class MainModule extends XposedModule {
                     try {
                         targetScore = Integer.parseInt(et.getText().toString().trim());
                         enabled = true;
+                        updateToggleStyle(cachedToggleBtn);
                         Toast.makeText(act, "Auto-Play Target: " + targetScore, Toast.LENGTH_SHORT).show();
                     } catch (NumberFormatException ignored) {}
                 })
                 .setNeutralButton("Logs", (d, w) -> showLogsDialog(act))
                 .setNegativeButton("Off", (d, w) -> {
                     enabled = false;
+                    updateToggleStyle(cachedToggleBtn);
                     releaseTouch(act);
                     setKeepScreenOn(false);
                     Toast.makeText(act, "Auto-Play Off", Toast.LENGTH_SHORT).show();

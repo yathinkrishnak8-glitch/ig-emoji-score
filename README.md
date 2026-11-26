@@ -1,27 +1,22 @@
-# Xposed Module Template (Based on libxposed)
+# ig-emoji-score(yathin)
 
-This is a general-purpose Xposed module template built on [libxposed](https://github.com/libxposed/api).
+An Xposed / Vector (`libxposed` API 101) module for Instagram (`com.instagram.android`, tested on `v451.0.0.20.80`) that auto-plays the DM Emoji Pong mini-game up to your custom target score and automatically loses once reached.
 
-## How to Use
+## Features
 
-1. **Modify Package Name**: Change `namespace` and `applicationId` in `app/build.gradle` to your own package name.
-2. **Rename Package Directory**: Rename the `app/src/main/java/com/example/module` directory to match your package structure.
-3. **Update Module Entry Point**: 
-   - Implement your logic in `MainModule.java`.
-   - Update the class name in `app/src/main/resources/META-INF/xposed/java_init.list` to ensure it points to your `XposedModule` implementation class.
-4. **Configure Scope**:
-   - List the package names of the apps you want to hook in `app/src/main/resources/META-INF/xposed/scope.list` (one per line).
-5. **Set Compilation Parameters**:
-   - Modify `compileSdk` and `targetSdkVersion` in `app/build.gradle` as needed.
+- **Auto-Play + Auto-Lose:** Uses `Choreographer` vsync frame callbacks with horizontal velocity prediction to track the emoji ball smoothly at high speeds, then dodges the paddle once your target score is reached so the round ends naturally and saves your score.
+- **On-Screen Auto-Play Toggle:** Adds an **Auto: ON / OFF** toggle button directly to the left of the Leaderboard (`HI`) button inside Emoji Pong.
+- **Mid-Game Leaderboard Support:** You can open and close the Leaderboard mid-game; Auto-Play pauses while the Leaderboard is open and automatically resumes when closed.
+- **In-Game Target Menu:** Press **Volume Up** inside Emoji Pong to set your custom target score (default `99`), toggle Auto-Play, or view/copy logs. Normal Volume Up behavior is preserved everywhere.
+- **Touch Lock & Keep-Screen-On:** Ignores accidental touches in the playfield during active Auto-Play while keeping the top bar interactive, and keeps the screen awake while playing.
 
-## Key Components
+## Requirements
 
-- `MainModule.java`: The main entry point of the module, inheriting from `XposedModule`.
-- `java_init.list`: Tells libxposed which class is the entry point for the module.
-- `scope.list`: Defines the scope (apps) where the module will be active.
-- `module.prop`: Contains metadata information for the module.
+- Rooted Android device with **Vector** (or LSPosed fork supporting `libxposed` API 101)
+- Instagram (`com.instagram.android`) v451.0.0.20.80
 
-## Notes
+## Usage
 
-- This template uses the `libxposed` API. Please refer to its official documentation for more advanced usage.
-- Ensure that `compileOnly` dependencies are correctly configured during development to avoid bundling the Xposed API into your APK.
+1. Install the APK from [Releases](../../releases) and enable **ig-emoji-score(yathin)** in Vector/LSPosed with scope `com.instagram.android`.
+2. Open any DM Emoji Pong game in Instagram.
+3. Use the **Auto: ON / OFF** pill next to the Leaderboard button, or press **Volume Up** to set your target score.

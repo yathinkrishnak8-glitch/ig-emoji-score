@@ -16,6 +16,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "XposedModuleTemplate"
+rootProject.name = "ig-emoji-score"
 include(":app")
 includeBuild("libxposed-api")

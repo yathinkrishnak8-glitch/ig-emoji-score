@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">Xposed Module Template</string>
-    <string name="xposed_description">This is an Xposed module template based on libxposed.</string>
+    <string name="app_name">ig-emoji-score(yathin)</string>
+    <string name="xposed_description">Auto-play Emoji Pong in Instagram up to a custom target score.</string>
 </resources>
