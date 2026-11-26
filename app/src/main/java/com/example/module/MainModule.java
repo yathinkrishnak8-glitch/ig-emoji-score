@@ -44,6 +44,9 @@ public class MainModule extends XposedModule {
     private static boolean touchDown = false;
     private static long downTime = 0L;
     private static float prevBallCenterX = -1f;
+    private static int stuckFrames = 0;
+    private static boolean wasLeaderboardOpen = false;
+    private static long resumeAfterMs = 0L;
     private static ViewGroup cachedArena = null;
     private static TextView cachedScoreView = null;
     private static TextView cachedBallView = null;
@@ -84,10 +87,12 @@ public class MainModule extends XposedModule {
             Method dispatchTouch = Activity.class.getDeclaredMethod("dispatchTouchEvent", MotionEvent.class);
             hook(dispatchTouch).intercept(chain -> {
                 if (!dispatchingBotTouch && enabled && !dialogOpen && isArenaValid()) {
-                    int score = parseScore(cachedScoreView);
-                    if (score >= 0 && score < targetScore) {
-                        // Swallow accidental user touches while auto-playing
-                        return true;
+                    Activity act = activeActivity;
+                    if (act != null && !isLeaderboardOpen(act) && SystemClock.uptimeMillis() >= resumeAfterMs) {
+                        int score = parseScore(cachedScoreView);
+                        if (score >= 0 && score < targetScore) {
+                            return true;
+                        }
                     }
                 }
                 return chain.proceed();
@@ -97,11 +102,17 @@ public class MainModule extends XposedModule {
             hook(dispatchKey).intercept(chain -> {
                 KeyEvent ev = (KeyEvent) chain.getArg(0);
                 if (ev != null && ev.getAction() == KeyEvent.ACTION_DOWN
+                        && ev.getRepeatCount() == 0
                         && ev.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP
-                        && activeActivity != null) {
-                    promptScore(activeActivity);
-                    return true;
+                        && activeActivity != null && !dialogOpen) {
+                    if (!isArenaValid()) {
+                        findPongViews(activeActivity.getWindow().getDecorView());
+                    }
+                    if (isArenaValid()) {
+                        promptScore(activeActivity);
+                    }
                 }
+                // Always let Volume Up pass through normally
                 return chain.proceed();
             });
         } catch (Throwable t) {
@@ -127,7 +138,21 @@ public class MainModule extends XposedModule {
                         }
                         if (isArenaValid()) {
                             setKeepScreenOn(true);
-                            stepBot(act);
+                            if (isLeaderboardOpen(act)) {
+                                wasLeaderboardOpen = true;
+                                prevBallCenterX = -1f;
+                                releaseTouch(act);
+                            } else {
+                                if (wasLeaderboardOpen) {
+                                    wasLeaderboardOpen = false;
+                                    resumeAfterMs = nowMs + 300;
+                                    prevBallCenterX = -1f;
+                                    releaseTouch(act);
+                                }
+                                if (nowMs >= resumeAfterMs) {
+                                    stepBot(act);
+                                }
+                            }
                         } else {
                             prevBallCenterX = -1f;
                             releaseTouch(act);
@@ -292,22 +317,37 @@ public class MainModule extends XposedModule {
 
         int[] padLoc = new int[2];
         cachedPaddleView.getLocationInWindow(padLoc);
-        float padY = padLoc[1] + cachedPaddleView.getHeight() / 2f;
         float padHalfW = cachedPaddleView.getWidth() / 2f;
+        float padCenterX = padLoc[0] + padHalfW;
+        float padY = padLoc[1] + cachedPaddleView.getHeight() / 2f;
 
         float targetX;
         if (currentScore < targetScore) {
-            // Predict slightly ahead so high-speed bounces (score 68+) never lag
             float predictedX = ballCenterX + dx * 0.85f;
             targetX = Math.max(arenaLeft + padHalfW, Math.min(arenaLeft + arenaWidth - padHalfW, predictedX));
         } else {
-            // Auto-lose: dodge to the opposite side from the ball
             float arenaCenterX = arenaLeft + arenaWidth / 2f;
             if (ballCenterX < arenaCenterX) {
                 targetX = arenaLeft + arenaWidth - padHalfW;
             } else {
                 targetX = arenaLeft + padHalfW;
             }
+        }
+
+        // Self-heal if an earlier ACTION_DOWN was swallowed by a closing sheet/overlay
+        if (touchDown) {
+            if (Math.abs(padCenterX - targetX) > 60f) {
+                stuckFrames++;
+                if (stuckFrames >= 6) {
+                    stuckFrames = 0;
+                    releaseTouch(act);
+                    return;
+                }
+            } else {
+                stuckFrames = 0;
+            }
+        } else {
+            stuckFrames = 0;
         }
 
         long now = SystemClock.uptimeMillis();
@@ -348,6 +388,7 @@ public class MainModule extends XposedModule {
     private static void releaseTouch(Activity act) {
         if (!touchDown) return;
         touchDown = false;
+        stuckFrames = 0;
         if (act != null && !act.isFinishing()) {
             long now = SystemClock.uptimeMillis();
             dispatchingBotTouch = true;
@@ -405,7 +446,6 @@ public class MainModule extends XposedModule {
         dialogOpen = true;
         releaseTouch(act);
 
-        // Open Leaderboard in background if in Emoji Pong so the game pauses
         final boolean openedLeaderboard;
         if (isArenaValid() && !isLeaderboardOpen(act) && cachedHighScoreContainer != null) {
             cachedHighScoreContainer.performClick();
@@ -438,6 +478,9 @@ public class MainModule extends XposedModule {
 
         dlg.setOnDismissListener(d -> {
             dialogOpen = false;
+            prevBallCenterX = -1f;
+            releaseTouch(act);
+            resumeAfterMs = SystemClock.uptimeMillis() + 350;
             if (openedLeaderboard && isLeaderboardOpen(act) && cachedArena != null) {
                 mainHandler.postDelayed(() -> {
                     if (isLeaderboardOpen(act) && cachedArena != null) {
