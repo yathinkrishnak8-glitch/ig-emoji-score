@@ -7,6 +7,7 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.StrictMode;
 import android.os.SystemClock;
 import android.text.InputType;
 import android.util.Log;
@@ -26,11 +27,13 @@ import java.lang.reflect.Method;
 import java.util.Deque;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
+import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 
 public class MainModule extends XposedModule {
 
     private static final String TAG = "IG-Emoji-Score";
+    private static final String MODAL_ACTIVITY = "com.instagram.modal.ModalActivity";
     private static final int MAX_LOG_LINES = 150;
     private static volatile int targetScore = 99;
     private static volatile boolean enabled = true;
@@ -68,56 +71,110 @@ public class MainModule extends XposedModule {
         if (!"com.instagram.android".equals(param.getPackageName())) return;
         addLog("onPackageReady: hooking com.instagram.android");
 
+        installRuntimeGuard();
+
         try {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
-            hook(onResume).intercept(chain -> {
-                Object result = chain.proceed();
-                activeActivity = (Activity) chain.getThisObject();
-                startBotLoop();
-                return result;
-            });
+            hook(onResume)
+                    .setPriority(XposedInterface.PRIORITY_LOWEST)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object result = chain.proceed();
+                        Activity act = (Activity) chain.getThisObject();
+                        activeActivity = act;
+                        if (isModalActivity(act)) {
+                            startBotLoop();
+                        } else {
+                            stopBotLoop();
+                        }
+                        return result;
+                    });
 
             Method onPause = Activity.class.getDeclaredMethod("onPause");
-            hook(onPause).intercept(chain -> {
-                releaseTouch(activeActivity);
-                setKeepScreenOn(false);
-                return chain.proceed();
-            });
+            hook(onPause)
+                    .setPriority(XposedInterface.PRIORITY_LOWEST)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        releaseTouch(activeActivity);
+                        setKeepScreenOn(false);
+                        return chain.proceed();
+                    });
 
             Method dispatchTouch = Activity.class.getDeclaredMethod("dispatchTouchEvent", MotionEvent.class);
-            hook(dispatchTouch).intercept(chain -> {
-                if (!dispatchingBotTouch && enabled && !dialogOpen && isArenaValid()) {
-                    Activity act = activeActivity;
-                    if (act != null && !isLeaderboardOpen(act) && SystemClock.uptimeMillis() >= resumeAfterMs) {
-                        int score = parseScore(cachedScoreView);
-                        if (score >= 0 && score < targetScore) {
-                            return true;
+            hook(dispatchTouch)
+                    .setPriority(XposedInterface.PRIORITY_LOWEST)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        if (!dispatchingBotTouch && enabled && !dialogOpen && isModalActivity(activeActivity) && isArenaValid()) {
+                            Activity act = activeActivity;
+                            if (act != null && !isLeaderboardOpen(act) && SystemClock.uptimeMillis() >= resumeAfterMs) {
+                                int score = parseScore(cachedScoreView);
+                                if (score >= 0 && score < targetScore) {
+                                    return true;
+                                }
+                            }
                         }
-                    }
-                }
-                return chain.proceed();
-            });
+                        return chain.proceed();
+                    });
 
             Method dispatchKey = Activity.class.getDeclaredMethod("dispatchKeyEvent", KeyEvent.class);
-            hook(dispatchKey).intercept(chain -> {
-                KeyEvent ev = (KeyEvent) chain.getArg(0);
-                if (ev != null && ev.getAction() == KeyEvent.ACTION_DOWN
-                        && ev.getRepeatCount() == 0
-                        && ev.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP
-                        && activeActivity != null && !dialogOpen) {
-                    if (!isArenaValid()) {
-                        findPongViews(activeActivity.getWindow().getDecorView());
-                    }
-                    if (isArenaValid()) {
-                        promptScore(activeActivity);
-                    }
-                }
-                // Always let Volume Up pass through normally
-                return chain.proceed();
-            });
+            hook(dispatchKey)
+                    .setPriority(XposedInterface.PRIORITY_LOWEST)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        KeyEvent ev = (KeyEvent) chain.getArg(0);
+                        if (ev != null && ev.getAction() == KeyEvent.ACTION_DOWN
+                                && ev.getRepeatCount() == 0
+                                && ev.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP
+                                && isModalActivity(activeActivity) && !dialogOpen) {
+                            if (!isArenaValid()) {
+                                findPongViews(activeActivity.getWindow().getDecorView());
+                            }
+                            if (isArenaValid()) {
+                                promptScore(activeActivity);
+                            }
+                        }
+                        return chain.proceed();
+                    });
         } catch (Throwable t) {
             addLog("Hook setup error: " + t.getMessage());
         }
+    }
+
+    private void installRuntimeGuard() {
+        try {
+            StrictMode.setThreadPolicy(new StrictMode.ThreadPolicy.Builder().permitAll().build());
+            StrictMode.setVmPolicy(new StrictMode.VmPolicy.Builder().build());
+        } catch (Throwable ignored) {}
+
+        try {
+            final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+            Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+                if (thread != Looper.getMainLooper().getThread()) {
+                    addLog("BG guard caught: " + throwable.getClass().getSimpleName());
+                    return;
+                }
+                if (prev != null) {
+                    prev.uncaughtException(thread, throwable);
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean isModalActivity(Activity act) {
+        return act != null && MODAL_ACTIVITY.equals(act.getClass().getName());
+    }
+
+    private static void stopBotLoop() {
+        loopRunning = false;
+        prevBallCenterX = -1f;
+        releaseTouch(activeActivity);
+        setKeepScreenOn(false);
+        cachedArena = null;
+        cachedScoreView = null;
+        cachedBallView = null;
+        cachedPaddleView = null;
+        cachedHighScoreContainer = null;
     }
 
     private static void startBotLoop() {
@@ -128,9 +185,10 @@ public class MainModule extends XposedModule {
 
             @Override
             public void doFrame(long frameTimeNanos) {
+                if (!loopRunning) return;
                 try {
                     Activity act = activeActivity;
-                    if (enabled && !dialogOpen && act != null && !act.isFinishing()) {
+                    if (enabled && !dialogOpen && isModalActivity(act) && !act.isFinishing()) {
                         long nowMs = SystemClock.uptimeMillis();
                         if (!isArenaValid() && nowMs - lastScanMs >= 200) {
                             lastScanMs = nowMs;
@@ -164,7 +222,9 @@ public class MainModule extends XposedModule {
                         setKeepScreenOn(false);
                     }
                 } catch (Throwable ignored) {}
-                Choreographer.getInstance().postFrameCallback(this);
+                if (loopRunning) {
+                    Choreographer.getInstance().postFrameCallback(this);
+                }
             }
         });
     }
@@ -334,7 +394,6 @@ public class MainModule extends XposedModule {
             }
         }
 
-        // Self-heal if an earlier ACTION_DOWN was swallowed by a closing sheet/overlay
         if (touchDown) {
             if (Math.abs(padCenterX - targetX) > 60f) {
                 stuckFrames++;
