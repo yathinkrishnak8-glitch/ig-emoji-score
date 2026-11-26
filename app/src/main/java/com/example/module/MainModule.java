@@ -51,16 +51,27 @@ public class MainModule extends XposedModule {
     private static boolean loopRunning = false;
     private static boolean touchDown = false;
     private static long downTime = 0L;
-    private static float prevBallCenterX = -1f;
+    private static float prevBallLocalX = -1f;
+    private static float prevPadLocalX = -1f;
+    private static float lastSentX = -1f;
     private static int stuckFrames = 0;
+
+    private static boolean cachedLeaderboardOpen = false;
+    private static long lastLbCheckMs = 0L;
     private static boolean wasLeaderboardOpen = false;
     private static long resumeAfterMs = 0L;
+
     private static ViewGroup cachedArena = null;
     private static TextView cachedScoreView = null;
     private static TextView cachedBallView = null;
     private static View cachedPaddleView = null;
     private static View cachedHighScoreContainer = null;
     private static TextView cachedToggleBtn = null;
+    private static boolean lastBtnEnabled = !enabled;
+    private static float lastBtnX = -1f;
+    private static float lastBtnY = -1f;
+    private static float cachedArenaLeft = -1f;
+    private static float cachedArenaTop = -1f;
 
     private void addLog(String msg) {
         logBuffer.addLast(msg);
@@ -114,12 +125,9 @@ public class MainModule extends XposedModule {
                         if (!dispatchingBotTouch && enabled && !dialogOpen && isModalActivity(activeActivity) && isArenaValid()) {
                             Activity act = activeActivity;
                             MotionEvent ev = (MotionEvent) chain.getArg(0);
-                            if (act != null && ev != null && !isLeaderboardOpen(act) && SystemClock.uptimeMillis() >= resumeAfterMs) {
-                                int[] arenaLoc = new int[2];
-                                cachedArena.getLocationInWindow(arenaLoc);
-                                float topBarBottom = arenaLoc[1] + 280f;
+                            if (act != null && ev != null && !cachedLeaderboardOpen && SystemClock.uptimeMillis() >= resumeAfterMs) {
+                                float topBarBottom = (cachedArenaTop >= 0f ? cachedArenaTop : 0f) + 280f;
                                 if (ev.getRawY() < topBarBottom) {
-                                    // Allow top-bar taps (Leaderboard, Auto-Play toggle, Close)
                                     if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
                                         releaseTouch(act);
                                         resumeAfterMs = SystemClock.uptimeMillis() + 250;
@@ -185,7 +193,7 @@ public class MainModule extends XposedModule {
 
     private static void stopBotLoop() {
         loopRunning = false;
-        prevBallCenterX = -1f;
+        resetTrackingState();
         releaseTouch(activeActivity);
         setKeepScreenOn(false);
         hideToggleButton();
@@ -195,6 +203,15 @@ public class MainModule extends XposedModule {
         cachedPaddleView = null;
         cachedHighScoreContainer = null;
         cachedToggleBtn = null;
+        cachedArenaLeft = -1f;
+        cachedArenaTop = -1f;
+    }
+
+    private static void resetTrackingState() {
+        prevBallLocalX = -1f;
+        prevPadLocalX = -1f;
+        lastSentX = -1f;
+        stuckFrames = 0;
     }
 
     private static void startBotLoop() {
@@ -210,7 +227,7 @@ public class MainModule extends XposedModule {
                     Activity act = activeActivity;
                     if (isModalActivity(act) && !act.isFinishing()) {
                         long nowMs = SystemClock.uptimeMillis();
-                        if (!isArenaValid() && nowMs - lastScanMs >= 200) {
+                        if (!isArenaValid() && nowMs - lastScanMs >= 250) {
                             lastScanMs = nowMs;
                             findPongViews(act.getWindow().getDecorView());
                         }
@@ -218,15 +235,19 @@ public class MainModule extends XposedModule {
                             ensureToggleButton(act);
                             if (enabled && !dialogOpen) {
                                 setKeepScreenOn(true);
-                                if (isLeaderboardOpen(act)) {
+                                if (nowMs - lastLbCheckMs >= 150) {
+                                    lastLbCheckMs = nowMs;
+                                    cachedLeaderboardOpen = isLeaderboardOpen(act);
+                                }
+                                if (cachedLeaderboardOpen) {
                                     wasLeaderboardOpen = true;
-                                    prevBallCenterX = -1f;
+                                    resetTrackingState();
                                     releaseTouch(act);
                                 } else {
                                     if (wasLeaderboardOpen) {
                                         wasLeaderboardOpen = false;
                                         resumeAfterMs = nowMs + 300;
-                                        prevBallCenterX = -1f;
+                                        resetTrackingState();
                                         releaseTouch(act);
                                     }
                                     if (nowMs >= resumeAfterMs) {
@@ -234,19 +255,19 @@ public class MainModule extends XposedModule {
                                     }
                                 }
                             } else {
-                                prevBallCenterX = -1f;
+                                resetTrackingState();
                                 releaseTouch(act);
                                 setKeepScreenOn(false);
                             }
                         } else {
                             hideToggleButton();
-                            prevBallCenterX = -1f;
+                            resetTrackingState();
                             releaseTouch(act);
                             setKeepScreenOn(false);
                         }
                     } else {
                         hideToggleButton();
-                        prevBallCenterX = -1f;
+                        resetTrackingState();
                         releaseTouch(act);
                         setKeepScreenOn(false);
                     }
@@ -264,6 +285,7 @@ public class MainModule extends XposedModule {
         ViewGroup parent = (ViewGroup) cachedArena.getParent();
 
         TextView btn = cachedToggleBtn;
+        boolean newlyCreated = false;
         if (btn == null || !btn.isAttachedToWindow()) {
             View existing = parent.findViewWithTag(TOGGLE_TAG);
             if (existing instanceof TextView) {
@@ -283,7 +305,7 @@ public class MainModule extends XposedModule {
                         releaseTouch(act);
                         setKeepScreenOn(false);
                     } else {
-                        prevBallCenterX = -1f;
+                        resetTrackingState();
                     }
                     Toast.makeText(act, enabled ? "Auto-Play ON (" + targetScore + ")" : "Auto-Play OFF", Toast.LENGTH_SHORT).show();
                 });
@@ -291,38 +313,48 @@ public class MainModule extends XposedModule {
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT);
                 parent.addView(btn, lp);
+                newlyCreated = true;
             }
             cachedToggleBtn = btn;
+            lastBtnEnabled = !enabled;
+            lastBtnX = -1f;
+            lastBtnY = -1f;
         }
 
-        updateToggleStyle(btn);
-        btn.setVisibility(View.VISIBLE);
-
-        if (btn.getWidth() == 0) {
-            btn.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+        if (lastBtnEnabled != enabled) {
+            updateToggleStyle(btn);
         }
-        int btnW = btn.getWidth() > 0 ? btn.getWidth() : btn.getMeasuredWidth();
-        int btnH = btn.getHeight() > 0 ? btn.getHeight() : btn.getMeasuredHeight();
+        if (btn.getVisibility() != View.VISIBLE) {
+            btn.setVisibility(View.VISIBLE);
+        }
 
-        int[] hiLoc = new int[2];
-        int[] parentLoc = new int[2];
-        cachedHighScoreContainer.getLocationInWindow(hiLoc);
-        parent.getLocationInWindow(parentLoc);
+        if (newlyCreated || lastBtnX < 0f) {
+            if (btn.getWidth() == 0) {
+                btn.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+            }
+            int btnW = btn.getWidth() > 0 ? btn.getWidth() : btn.getMeasuredWidth();
+            int btnH = btn.getHeight() > 0 ? btn.getHeight() : btn.getMeasuredHeight();
 
-        float hiLeftInParent = hiLoc[0] - parentLoc[0];
-        float hiTopInParent = hiLoc[1] - parentLoc[1];
-        int hiH = cachedHighScoreContainer.getHeight();
+            int[] hiLoc = new int[2];
+            int[] parentLoc = new int[2];
+            cachedHighScoreContainer.getLocationInWindow(hiLoc);
+            parent.getLocationInWindow(parentLoc);
 
-        btn.setX(Math.max(16f, hiLeftInParent - btnW - 20f));
-        btn.setY(Math.max(16f, hiTopInParent + (hiH - btnH) / 2f));
+            float newX = Math.max(16f, (hiLoc[0] - parentLoc[0]) - btnW - 20f);
+            float newY = Math.max(16f, (hiLoc[1] - parentLoc[1]) + (cachedHighScoreContainer.getHeight() - btnH) / 2f);
+            if (Math.abs(newX - lastBtnX) > 2f || Math.abs(newY - lastBtnY) > 2f) {
+                btn.setX(newX);
+                btn.setY(newY);
+                lastBtnX = newX;
+                lastBtnY = newY;
+            }
+        }
     }
 
     private static void updateToggleStyle(TextView btn) {
         if (btn == null) return;
-        String label = enabled ? "Auto: ON" : "Auto: OFF";
-        if (!label.contentEquals(btn.getText())) {
-            btn.setText(label);
-        }
+        lastBtnEnabled = enabled;
+        btn.setText(enabled ? "Auto: ON" : "Auto: OFF");
         GradientDrawable bg = new GradientDrawable();
         bg.setCornerRadius(40f);
         bg.setColor(enabled ? Color.parseColor("#CC16A34A") : Color.parseColor("#CCDC2626"));
@@ -331,7 +363,7 @@ public class MainModule extends XposedModule {
 
     private static void hideToggleButton() {
         try {
-            if (cachedToggleBtn != null) {
+            if (cachedToggleBtn != null && cachedToggleBtn.getVisibility() != View.GONE) {
                 cachedToggleBtn.setVisibility(View.GONE);
             }
         } catch (Throwable ignored) {}
@@ -362,6 +394,8 @@ public class MainModule extends XposedModule {
         cachedBallView = null;
         cachedPaddleView = null;
         cachedHighScoreContainer = null;
+        cachedArenaLeft = -1f;
+        cachedArenaTop = -1f;
         if (root instanceof ViewGroup) {
             scanGroup((ViewGroup) root);
         }
@@ -413,6 +447,10 @@ public class MainModule extends XposedModule {
             cachedBallView = ballCandidate;
             cachedPaddleView = paddleCandidate;
             cachedHighScoreContainer = highScoreContainer;
+            int[] arenaLoc = new int[2];
+            vg.getLocationInWindow(arenaLoc);
+            cachedArenaLeft = arenaLoc[0];
+            cachedArenaTop = arenaLoc[1];
             return true;
         }
 
@@ -466,46 +504,40 @@ public class MainModule extends XposedModule {
         int currentScore = parseScore(cachedScoreView);
         if (currentScore < 0) return;
 
-        int[] arenaLoc = new int[2];
-        cachedArena.getLocationInWindow(arenaLoc);
-        float arenaLeft = arenaLoc[0];
         float arenaWidth = cachedArena.getWidth();
         if (arenaWidth <= 0) return;
+        float arenaLeft = cachedArenaLeft >= 0f ? cachedArenaLeft : 0f;
+        float arenaTop = cachedArenaTop >= 0f ? cachedArenaTop : 0f;
 
-        int[] ballLoc = new int[2];
-        cachedBallView.getLocationInWindow(ballLoc);
-        float ballCenterX = ballLoc[0] + cachedBallView.getWidth() / 2f;
-
+        // Sub-pixel float coordinates relative to arena (no int[] rounding jitter)
+        float ballLocalX = cachedBallView.getX() + cachedBallView.getWidth() / 2f;
         float dx = 0f;
-        if (prevBallCenterX >= 0f) {
-            dx = ballCenterX - prevBallCenterX;
+        if (prevBallLocalX >= 0f) {
+            dx = ballLocalX - prevBallLocalX;
             if (Math.abs(dx) > 150f) dx = 0f;
         }
-        prevBallCenterX = ballCenterX;
+        prevBallLocalX = ballLocalX;
 
-        int[] padLoc = new int[2];
-        cachedPaddleView.getLocationInWindow(padLoc);
         float padHalfW = cachedPaddleView.getWidth() / 2f;
-        float padCenterX = padLoc[0] + padHalfW;
-        float padY = padLoc[1] + cachedPaddleView.getHeight() / 2f;
+        float padLocalX = cachedPaddleView.getX() + padHalfW;
+        float padY = arenaTop + cachedPaddleView.getY() + cachedPaddleView.getHeight() / 2f;
 
-        float targetX;
+        float targetLocalX;
         if (currentScore < targetScore) {
-            float predictedX = ballCenterX + dx * 0.85f;
-            targetX = Math.max(arenaLeft + padHalfW, Math.min(arenaLeft + arenaWidth - padHalfW, predictedX));
+            float lead = Math.abs(dx) > 4f ? dx * 0.55f : 0f;
+            targetLocalX = Math.max(padHalfW, Math.min(arenaWidth - padHalfW, ballLocalX + lead));
         } else {
-            float arenaCenterX = arenaLeft + arenaWidth / 2f;
-            if (ballCenterX < arenaCenterX) {
-                targetX = arenaLeft + arenaWidth - padHalfW;
-            } else {
-                targetX = arenaLeft + padHalfW;
-            }
+            targetLocalX = (ballLocalX < arenaWidth / 2f) ? (arenaWidth - padHalfW) : padHalfW;
         }
 
+        float targetX = arenaLeft + targetLocalX;
+
+        // Only re-anchor if paddle is genuinely unresponsive for ~25 frames
         if (touchDown) {
-            if (Math.abs(padCenterX - targetX) > 60f) {
+            float padMoved = prevPadLocalX >= 0f ? Math.abs(padLocalX - prevPadLocalX) : 0f;
+            if (Math.abs(padLocalX - targetLocalX) > 140f && padMoved < 1f) {
                 stuckFrames++;
-                if (stuckFrames >= 6) {
+                if (stuckFrames >= 25) {
                     stuckFrames = 0;
                     releaseTouch(act);
                     return;
@@ -515,6 +547,11 @@ public class MainModule extends XposedModule {
             }
         } else {
             stuckFrames = 0;
+        }
+        prevPadLocalX = padLocalX;
+
+        if (touchDown && lastSentX >= 0f && Math.abs(targetX - lastSentX) < 1.5f) {
+            return;
         }
 
         long now = SystemClock.uptimeMillis();
@@ -526,10 +563,12 @@ public class MainModule extends XposedModule {
                 act.dispatchTouchEvent(down);
                 down.recycle();
                 touchDown = true;
+                lastSentX = targetX;
             } else {
                 MotionEvent move = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_MOVE, targetX, padY, 0);
                 act.dispatchTouchEvent(move);
                 move.recycle();
+                lastSentX = targetX;
             }
         } finally {
             dispatchingBotTouch = false;
@@ -556,6 +595,7 @@ public class MainModule extends XposedModule {
         if (!touchDown) return;
         touchDown = false;
         stuckFrames = 0;
+        lastSentX = -1f;
         if (act != null && !act.isFinishing()) {
             long now = SystemClock.uptimeMillis();
             dispatchingBotTouch = true;
@@ -647,7 +687,7 @@ public class MainModule extends XposedModule {
 
         dlg.setOnDismissListener(d -> {
             dialogOpen = false;
-            prevBallCenterX = -1f;
+            resetTrackingState();
             releaseTouch(act);
             resumeAfterMs = SystemClock.uptimeMillis() + 350;
             if (openedLeaderboard && isLeaderboardOpen(act) && cachedArena != null) {
